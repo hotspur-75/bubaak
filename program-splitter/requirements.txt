@@ -1,0 +1,2 @@
+code_ast>=0.0.1
+tree_sitter==0.20.4

@@ -1,0 +1,17 @@
+# Verifiers and Large Binaries
+cpachecker/
+klee/
+slowbeast/
+svcomptools/
+lib/
+svcomp/
+
+# Python cache and temporary files
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+/tmp/
+
+# Log files from runs
+*.log
+witness.graphml

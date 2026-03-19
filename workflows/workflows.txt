@@ -1,0 +1,4384 @@
+
+
+--- FILE: ./cbmc.py ---
+from bbk.compiler import CompilerTask
+from bbk.timeout import TimeoutWatchdog
+
+from bbk.tools.cbmc import Cbmc
+from bbk.workflow import Workflow
+
+
+def create_init_task(programs, args, cmdargs, properties):
+    """
+    The workflow for Bubaak that runs only CBMC
+    """
+
+    return TimeoutWatchdog(
+        Cbmc(programs, properties, args + cmdargs.X), cmdargs.timeout
+    )
+
+
+def workflow(programs, args, cmdargs, properties):
+    return Workflow([create_init_task(programs, args, cmdargs, properties)])
+
+
+--- FILE: ./cmc.py ---
+import sys
+from os import makedirs
+from os.path import join as pathjoin, basename, splitext, exists
+
+from bbk.dbg import dbg
+from bbk.env import get_env
+
+from bbk.task.task import Task
+from bbk.task.result import TaskResult
+from bbk.task.continuationtask import ContinuationTask
+
+from bbk.verdict import Verdict
+from bbk.compiler import CompilationUnit
+
+from bbk.timeout import TimeoutWatchdog
+
+from bbk.workflow import Workflow
+
+from bbk.tools.cpachecker import CPAchecker
+
+from bbk.utils import find_file_in_dirs
+
+from .flows import CPAcheckerVerifier, KLEEVerifier
+from .splitflows import create_verifier, task_result_is_conclusive
+
+
+def _has_error(result):
+    return isinstance(result.output, list) and any(
+        (isinstance(r, Verdict) and r.is_error()) for r in result.output
+    )
+
+
+class ReduceBackup(ContinuationTask):
+
+    def __init__(self, verifier, reduced_task, backup_task):
+        super().__init__(
+            verifier(reduced_task),
+            name = "VerifyWithBackup"
+        )
+
+        self._verifier     = verifier
+        self._reduced_task = reduced_task
+        self._backup_task  = backup_task
+
+    def continuation(self, result):
+        if result.is_done() and task_result_is_conclusive(result):
+            return result
+        
+        return TaskResult("REPLACE_TASK", output = self._verifier(self._backup_task))
+
+
+class ReduceAndVerify(ContinuationTask):
+
+    def __init__(self, verifier, input_file, condition, fold = False):
+        options = [
+            "-residualProgramGenerator" if not fold else "-residualProgramGenerator-CFA",
+            "-setprop", 
+            f"AssumptionAutomaton.cpa.automaton.inputFile={condition}"
+        ]
+
+        super().__init__(
+            CPAchecker(
+                [input_file],
+                [verifier.property],
+                args = options,
+            ),
+            name = "Reducer"
+        )
+
+        self._verifier = verifier
+        self._input_file = input_file
+        self._condition = condition
+
+
+    def continuation(self, result):
+        if not result.is_done(): 
+            return result
+        
+        residual = None
+
+        if not _has_error(result):
+            residual = find_file_in_dirs(
+                "residual_program.c",
+                [f"{get_env().workdir}/output/"]
+            )
+
+        if residual is None or not exists(residual):
+            dbg(f"Generator did not produce a residual program at path {self._condition}. Continue with verifier.")
+            return TaskResult("REPLACE_TASK", output = self._verifier(self._input_file))
+
+        residual = CompilationUnit(residual)
+        return TaskResult("REPLACE_TASK", output = self._verifier(residual))
+
+
+class VerifyAndReduce(ContinuationTask):
+
+    def __init__(self, generator_task, input_file, verifier = None, fold = False):
+        super().__init__(
+            generator_task,
+            name = "VerifyAndReduce"
+        )
+
+        self._input_file = input_file
+        self._verifier   = verifier
+        self._fold       = fold
+
+    def continuation(self, result):
+        if result.is_done() and task_result_is_conclusive(result):
+            return result
+        
+        if self._verifier is None: return result
+        
+        condition = find_file_in_dirs(
+            "AssumptionAutomaton.txt",
+            [f"{get_env().workdir}/output/"]
+        )
+
+        if condition is None or not exists(condition):
+            dbg(f"Generator did not produce a condition at path {condition}. Continue with verifier.")
+            return TaskResult("REPLACE_TASK", output = self._verifier(self._input_file))
+        
+        return TaskResult("REPLACE_TASK", output = ReduceAndVerify(
+            self._verifier, self._input_file, condition, fold = self._fold
+        ))
+        
+
+
+class VerifyAndCMC(ContinuationTask):
+
+    def __init__(self, generator_task, input_file, verifier = None):
+        super().__init__(
+            generator_task,
+            name = "VerifyAndReduce"
+        )
+
+        self._input_file = input_file
+        self._verifier   = verifier
+
+    def continuation(self, result):
+        if result.is_done() and task_result_is_conclusive(result):
+            return result
+        
+        if self._verifier is None: return result
+        
+        condition = find_file_in_dirs(
+            "AssumptionAutomaton.txt",
+            [f"{get_env().workdir}/output/"]
+        )
+
+        if condition is None or not exists(condition):
+            dbg(f"Generator did not produce a condition at path {condition}. Continue with verifier.")
+            return TaskResult("REPLACE_TASK", output = self._verifier(self._input_file))
+        
+        self._verifier.args.X += [
+            "-setprop", 
+            f"AssumptionAutomaton.cpa.automaton.inputFile={condition}"
+        ]
+        
+        self._verifier.config_name += "-USE-CMC"
+        return TaskResult("REPLACE_TASK", output = self._verifier(self._input_file))
+        
+
+
+def create_generator(name, args, properties, timeout = None):
+    
+    if name == "se":
+        return CPAcheckerVerifier(
+            "symbolicExecution-CMC", args, properties[0], timeout=timeout
+        )
+    
+    if name == "senoa":
+        return CPAcheckerVerifier(
+            "symbolicExecution", args, properties[0], timeout=timeout
+        )
+    
+    if name == "klee":
+        return KLEEVerifier(args, properties[0], timeout = timeout)
+
+    if name == "bmc":
+        return CPAcheckerVerifier(
+            "bmc-CMC", args, properties[0], timeout=timeout
+        )
+
+    if name == "ki":
+        return CPAcheckerVerifier(
+            "kInduction-CMC", args, properties[0], timeout=timeout
+        )
+
+    if name == "pa":
+        return CPAcheckerVerifier(
+            "predicateAnalysis-CMC", args, properties[0], timeout=timeout
+        )
+
+    raise NotImplementedError("Unknown CMC verifier: %s" % name)
+
+
+
+def create_init_task(programs, args, cmdargs, properties):
+    """
+    The workflow for Bubaak that runs reducer based CMC
+    """
+
+    assert len(programs) == 1, "Multiple programs not supported by the splitter"
+
+    workflow = cmdargs.workflow
+    _, generator, *verifier = workflow.split("-")
+
+    assert len(verifier) >= 1, "Need at least one verifier"
+
+    fold = False
+    direct = False
+    if len(verifier) == 2:
+        assert verifier[0] in ["fold", "direct"]
+        fold = verifier[0] == "fold"
+        direct = verifier[0] == "direct"
+        verifier = verifier[1]
+    else:
+        assert len(verifier) == 1
+        verifier = verifier[0]
+
+    if generator != "id":
+
+        if cmdargs.timeout is None or cmdargs.timeout >= 800:
+            gen_timeout = 100
+        else:
+            gen_timeout = max(4, int(0.1 * cmdargs.timeout))
+
+        generator = create_generator(
+            generator, cmdargs, properties, timeout = gen_timeout
+        )(programs[0])
+    
+    else:
+        generator = None
+
+    if verifier == "id":
+        verifier = None
+    else:
+        verifier = create_verifier(
+            verifier, cmdargs, properties, timeout = None
+        )
+
+    assert generator is not None or verifier is not None, "Either generator or verifier has to be existent"
+
+    if generator is not None:
+        if direct:
+            verify_reduce = VerifyAndCMC(generator, programs[0], verifier)
+        else:
+            verify_reduce = VerifyAndReduce(generator, programs[0], verifier, fold = fold)
+    else:
+        verify_reduce = verifier(programs[0])
+
+    return TimeoutWatchdog(
+        verify_reduce, cmdargs.timeout
+    )
+
+
+def workflow(programs, args, cmdargs, properties):
+    return Workflow([create_init_task(programs, args, cmdargs, properties)])
+
+
+--- FILE: ./cpachecker.py ---
+from bbk.compiler import CompilerTask
+from bbk.timeout import TimeoutWatchdog
+from bbk.dbg import dbg
+
+from bbk.tools.cpachecker import CPAchecker
+from bbk.workflow import Workflow
+
+
+def create_init_task(programs, args, cmdargs, properties):
+    """
+    The workflow for Bubaak that runs only CPAchecker
+    """
+
+    the_args = args + cmdargs.X.copy()
+    if not the_args:
+        dbg("No configuration specified for CPAchecker, using predicate analysis")
+        the_args.append("-predicateAnalysis")
+    return TimeoutWatchdog(CPAchecker(programs, properties, the_args), cmdargs.timeout)
+
+
+def workflow(programs, args, cmdargs, properties):
+    return Workflow([create_init_task(programs, args, cmdargs, properties)])
+
+
+--- FILE: ./default.py ---
+from tempfile import mktemp
+
+from bbk.timeout import TimeoutWatchdog
+from bbk.compiler import CompilerTask, CompilationOptions
+from bbk.task.aggregatetask import AggregateTask
+from bbk.task.result import TaskResult
+from bbk.verdict import Verdict
+from bbk.env import get_env
+
+from bbk.tools.klee import Klee, get_klee_args
+from bbk.tools.slowbeast import SlowBeast, get_slowbeast_args
+from bbk.workflow import Workflow
+
+
+def found_bug(result):
+    return isinstance(result.output, list) and any(
+        (isinstance(r, Verdict) and r.is_incorrect()) for r in result.output
+    )
+
+
+def task_result_is_conclusive(result):
+    return result.is_done() and (
+        any((isinstance(r, Verdict) and r.is_incorrect() for r in result.output))
+        or all((isinstance(r, Verdict) and r.is_correct() for r in result.output))
+    )
+
+
+class VerificationData:
+    def __init__(self, inputs, properties, args):
+        self.inputs = inputs
+        self.properties = properties
+        self.args = args
+
+
+class CooperativeSeBself(AggregateTask):
+    """
+    Start SE and BSELF in SlowBeast in parallel with cooperation.
+    """
+
+    def __init__(self, bitcode, data):
+        super().__init__([], name="CoopSlowBeast")
+        self._bitcode = bitcode
+        self.data = data
+
+    def execute(self):
+        chan = mktemp(dir=get_env().workdir, prefix="chan-")
+
+        self.add_subtask(
+            SlowBeast(
+                self._bitcode,
+                self.data.properties,
+                get_slowbeast_args(
+                    self.data.args, self.data.properties, [f"-coop-channel=w:{chan}"]
+                ),
+            )
+        )
+
+        self.add_subtask(
+            SlowBeast(
+                self._bitcode,
+                self.data.properties,
+                get_slowbeast_args(
+                    self.data.args,
+                    self.data.properties,
+                    ["-bself", f"-coop-channel=r:{chan}"],
+                ),
+            )
+        )
+
+    def aggregate(self, task, result):
+        if task_result_is_conclusive(result):
+            return result
+        return None
+
+    def finish(self):
+        result = self.result()
+        if result is None:
+            return TaskResult(
+                "DONE",
+                output=[Verdict(Verdict.UNKNOWN, None, "No config got a result")],
+            )
+        return result
+
+
+class CompileAndCheck(CompilerTask):
+    def __init__(self, inputs, properties, include_dirs=None, options=None):
+        options = options or CompilationOptions()
+        if any((p.is_no_signed_overflow() for p in properties)):
+            options._sanitize.append("ubsan")
+        if any((p.is_valid_deref() for p in properties)):
+            options._sanitize.append("asan")
+
+        super().__init__(inputs, options=options, include_dirs=include_dirs)
+        self._properties = properties
+
+    def finish(self):
+        result = super().finish()
+        warnings = self.warnings()
+        if warnings:
+            overflow = self._properties.get("no-signed-overflow")
+            if overflow:
+                for line in warnings:
+                    if "warning: overflow in expression;" in line or (
+                        "implicit conversion" in line
+                        and "changes value from" in line
+                        and "to 'float'" not in line
+                    ):
+                        # This is a work-around for the problem that the translation to LLVM looses
+                        # some information -- in this case, an overflow is detected by clang, reported,
+                        # but LLVM is generated without this overflow
+                        return TaskResult(
+                            "DONE",
+                            [
+                                Verdict(
+                                    Verdict.INCORRECT,
+                                    overflow,
+                                    "Signed overflow detected",
+                                )
+                            ],
+                        )
+
+        return result
+
+
+class StartTerminationVerification(AggregateTask):
+    """
+    Start KLEE and SlowBeast in parallel for verifying termination
+    """
+
+    def __init__(self, bitcode, data):
+        super().__init__([], name="StartTerminationVerification")
+        self._bitcode = bitcode
+        self.data = data
+
+    def execute(self):
+        self.add_subtask(
+            Klee(
+                self._bitcode,
+                self.data.properties,
+                get_klee_args(self.data.args, self.data.properties),
+            )
+        )
+
+        self.add_subtask(
+            SlowBeast(
+                self._bitcode,
+                self.data.properties,
+                get_slowbeast_args(self.data.args, self.data.properties),
+            )
+        )
+
+    def aggregate(self, task, result):
+        if task_result_is_conclusive(result):
+            return result
+        return None
+
+
+class StartVerificationKlee(Klee):
+    def __init__(self, bitcode, data):
+        to = data.args.timeout
+        if to is not None and to > 0:
+            klee_timeout = max(int(to / 3), 10)
+        else:
+            klee_timeout = 123
+
+        super().__init__(
+            bitcode,
+            data.properties,
+            get_klee_args(data.args, data.properties),
+            timeout=klee_timeout,
+            name="StartVerificationKlee",
+        )
+        self._bitcode = bitcode
+        self.data = data
+
+    def klee_failed_on_floats(self):
+        for r in self.parser().killed_paths():
+            if "silently concretizing (reason: floating point)" in r.info():
+                return True
+        return False
+
+    def finish(self):
+        result = super().finish()
+        if task_result_is_conclusive(result):
+            return result
+
+        properties = self.data.properties
+
+        if self.klee_failed_on_floats():
+            args = get_slowbeast_args(self.data.args, properties)
+            task = SlowBeast(
+                self._bitcode, self.data.properties, args=args, name="sb-se"
+            )
+            return TaskResult("REPLACE_TASK", task)
+
+        if any((p.is_no_signed_overflow() for p in properties)) or any(
+            (p.is_valid_deref() for p in properties)
+        ):
+            # we need to recompile the input file, because KLEE used sanitizers
+            task = CompileAndCheck(
+                self.data.inputs, self.data.properties, include_dirs=self.data.args.I
+            ) >> CooperativeSeBself(
+                result.output,
+                self.data,
+            )
+        else:
+            task = CooperativeSeBself(
+                self._bitcode,
+                self.data,
+            )
+
+        return TaskResult("REPLACE_TASK", task)
+
+
+def create_task(programs, args, cmdargs, properties):
+    """
+    The default workflow for Bubaak. The initial task is to compile the
+    programs into LLVM and then run LEE and SlowBeast in parallel on the
+    compiled program.
+    """
+
+    if args:
+        dbg("default takes no arguments, ignoring them")
+
+    if len(properties) == 1 and properties[0].is_termination():
+        init = CompilerTask(programs, include_dirs=cmdargs.I) >> (
+            lambda result: StartTerminationVerification(
+                result.output, VerificationData(programs, properties, cmdargs)
+            ),
+        )
+    else:
+        init = CompileAndCheck(programs, properties, include_dirs=cmdargs.I) >> (
+            lambda result: TaskResult(
+                "REPLACE_TASK",
+                StartVerificationKlee(
+                    result.output, VerificationData(programs, properties, cmdargs)
+                ),
+            )
+            # Compilation succeeded and bug was not found, so start verifiers
+            if result.is_done() and not found_bug(result)
+            else result
+        )
+
+    assert init
+    return TimeoutWatchdog(init, cmdargs.timeout)
+
+
+def workflow(programs, args, cmdargs, properties):
+    return Workflow([create_task(programs, args, cmdargs, properties)])
+
+
+--- FILE: ./dummy.py ---
+import sys
+from os import makedirs
+from os.path import join as pathjoin, basename, splitext
+
+from bbk.compiler import CompilerTask, CompilationUnit
+from bbk.dbg import dbg
+from bbk.dbg import print_stderr
+from bbk.env import get_env
+from bbk.task.aggregatetask import AggregateTask
+from bbk.task.continuationtask import ContinuationTask
+from bbk.task.result import TaskResult
+from bbk.tools.klee import Klee, get_klee_args
+from bbk.tools.slowbeast import SlowBeast, get_slowbeast_args
+from bbk.workflow import Workflow
+from bbk.verdict import Verdict
+
+from svcomp.witness_to_harness import convert_executable_witness_to_harness
+from .default import CompileAndCheck
+from .default import found_bug, task_result_is_conclusive
+
+from .flows.verifiers import KLEEVerifier, SlowBeastVerifier
+from .flows.split import DynamicSplittingVerifier, naive_merge
+
+from .flows.workstealing import WorkStealingComposition
+
+# Split verifier ------------------------------------------------------
+
+class CompileAndRunKLEE(ContinuationTask):
+    
+    def __init__(self, inputfile, args, properties, check = False, timeout = None, name = None):
+        if check:
+            compiler_task = CompileAndCheck([inputfile], properties)
+        else:
+            compiler_task = CompilerTask([inputfile])
+
+        super().__init__(compiler_task, name=name or "CompileAndRunKLEE")
+        self._args = args
+        self._properties = properties
+        self._inputfile = inputfile
+        self._timeout   = timeout
+    
+    def continuation(self, result):
+        if not result.is_done():
+            return TaskResult("ERROR", output=result, descr="Compiling {self._inputfile} failed")
+
+        return TaskResult("REPLACE_TASK",
+                          Klee(result.output, 
+                               self._properties, 
+                               get_klee_args(self._args, self._properties), 
+                               timeout=self._timeout))
+
+
+def create_split_verifier(splitv, split_config):
+    if splitv == "klee":
+        kwargs = {"args": split_config["args"], 
+                  "properties": split_config["properties"],
+                  "timeout": split_config["split_verifier_timeout"]}
+        return (lambda inputfile: CompileAndRunKLEE(inputfile, **kwargs))
+    
+    raise ValueError("Unknown split verifier: %s" % splitv)
+
+# Strong verifier ------------------------------------------------------------
+
+class CompileAndRunSlowBeast(ContinuationTask):
+    def __init__(self, inputfile, args, properties, handle_floats=False, timeout=None):
+        super().__init__(
+            CompileAndCheck([inputfile], properties, include_dirs=args.I),
+            name="CompileAndRunSlowBeast",
+        )
+        self._args = args
+        self._properties = properties
+        self._inputfile = inputfile
+        self._timeout = timeout
+        self._handle_floats = handle_floats
+    
+    def continuation(self, result):
+
+        if not result.is_done():
+            return TaskResult(
+                "ERROR", output=result, descr="Compiling {self._inputfile} failed"
+            )
+
+        if found_bug(result):
+            return result
+
+        properties = self._properties
+
+        if self._handle_floats:
+            args = get_slowbeast_args(self._args, properties)
+            name = "sb-se"
+        else:
+            args = get_slowbeast_args(self._args, properties, ["-bself"])
+            name = "sb-bself"
+        
+        if any((p.is_no_signed_overflow() for p in properties)) or any(
+            (p.is_valid_deref() for p in properties)
+        ):
+            # we need to recompile the input file, because KLEE used sanitizers
+            task = ContinuationTask(
+                CompileAndCheck(
+                    [self._inputfile], properties, include_dirs=self._args.I
+                ),
+                continuation=lambda result: TaskResult(
+                    "REPLACE_TASK",
+                    SlowBeast(
+                        result.output,
+                        properties,
+                        args=args,
+                        name=name,
+                        timeout=self._timeout,
+                    ),
+                )
+                # Compilation succeeded and bug was not found, so start verifiers
+                if result.is_done() else result,
+                descr="Compile and Start Slowbeast",
+            )
+        else:
+            task = SlowBeast(
+                result.output, properties, args=args, name=name, timeout=self._timeout
+            )
+
+        return TaskResult("REPLACE_TASK", task)
+    
+
+class ComposeResults(AggregateTask):
+    def __init__(self, subtasks, name="ComposeResults"):
+        super().__init__(subtasks, name=name)
+        self._splits_num = len(subtasks)
+        self._results = []
+
+    def aggregate(self, task, result):
+        if not result.is_done():
+            # some split failed verification, return immediately
+            return result
+
+        if any((r.is_incorrect() for r in result.output)):
+            result.task = task
+            return result
+
+        self._results.extend(result.output)
+
+        self._splits_num -= 1
+        if self._splits_num == 0:
+            return TaskResult("DONE", output=self._results)
+
+        # no result yet
+        return None
+
+
+def create_task(programs, args, cmdargs, properties):
+    """
+    The default workflow for Bubaak. The initial task is to compile the
+    programs into LLVM and then run LEE and SlowBeast in parallel on the
+    compiled program.
+    """
+
+    if args:
+        dbg("default takes no arguments, ignoring them")
+
+    klee = KLEEVerifier(
+        cmdargs, properties[0], timeout = 4
+    )
+
+    split_verifier = DynamicSplittingVerifier(klee, max_height=3)
+
+    sb = SlowBeastVerifier(cmdargs, properties[0], timeout = 10)
+    ws = WorkStealingComposition([sb])
+
+    def read_output(result):
+        print(result)
+        return result.verdicts()
+    
+    return split_verifier(programs[0]) >> ws >> read_output
+
+
+def workflow(programs, args, cmdargs, properties):
+    return Workflow([create_task(programs, args, cmdargs, properties)])
+
+
+--- FILE: ./flows/split.py ---
+""" Tasks for dynamically splitting programs """
+import sys
+import shutil
+from os import makedirs
+from os.path import join as pathjoin, basename, splitext
+
+from time import clock_gettime, CLOCK_REALTIME
+
+from bbk.dbg import dbg
+from bbk.dbg import print_stderr
+from bbk.env import get_env
+
+
+from bbk.task.task import Task
+from bbk.task.aggregatetask import AggregateTask
+from bbk.task.continuationtask import ContinuationTask
+
+from bbk.task.result import TaskResult
+from bbk.verdict import Verdict 
+
+from bbk.compiler import CompilationUnit
+
+# import the program splitter
+sys.path.insert(0, pathjoin(get_env().srcdir, "program-splitter"))
+from split import program_splitter
+
+try:
+    from cpasplit import program_splitter as cpasplitter
+except ImportError:
+    cpasplitter = None
+
+if cpasplitter: program_splitter = cpasplitter
+
+try:
+    from cpamerge import program_merger
+except ImportError:
+    program_merger = None
+
+sys.path.pop(0)
+
+
+from .verifiers import SoftwareVerifier
+from .verifiers import found_bug, task_result_is_conclusive
+
+# Splitting ---------------------------------
+
+class SplitTask(Task):
+    """
+    Split the given input file.
+    """
+
+    def __init__(self, input_file, options=None):
+        super().__init__(name="splitter", descr=f"Split '{input_file}'")
+
+        self._input = input_file
+        self._outputs = None
+        self._options = options
+        self._outdir = pathjoin(get_env().workdir, "splits/")
+
+        makedirs(self._outdir, exist_ok=True)
+
+    def execute(self):
+        filename = basename(self._input.path)
+        base, suffix = splitext(filename)
+
+        outputs = [
+            pathjoin(self._outdir, f"{base}-l{suffix}"),
+            pathjoin(self._outdir, f"{base}-r{suffix}"),
+        ]
+
+        kwargs = {}
+        if cpasplitter: 
+            kwargs["allowed_function_clones"] = self._options.get("function_clones", -1)
+            kwargs["deepening"]               = self._options.get("deepening", False)
+            kwargs["timeout"]                 = 60 # Make this configurable
+
+        try:
+            program_splitter(
+                self._input.path,
+                outputs[0],
+                outputs[1],
+                allowed_unrolls=self._options.get("loop_unrolls", -1),
+                max_line_limit=self._options.get("split_line_limit", 100_000),
+                **kwargs
+            )
+        except ValueError as e:
+            print_stderr(str(e))
+            self._result = TaskResult("ERROR", descr=str(e), task = self)
+            return
+
+        self._outputs = outputs
+
+    def is_done(self):
+        return self._outputs or self._result
+
+    def stop(self):
+        pass
+
+    def kill(self):
+        pass
+
+    def finish(self):
+        if self._result:
+            return self._result
+
+        if self._outputs:
+            return TaskResult(
+                "DONE",
+                output=[
+                    CompilationUnit(path, self._input.lang) for path in self._outputs
+                ], task = self
+            )
+
+        return TaskResult("ERROR", descr="Splitting produced nothing", task = self)
+
+# Dynamic Splitting ----------------------------------------------------------------
+
+class DynamicSplittingVerifier(SoftwareVerifier):
+    """
+    Run dynamic program splitting with the given
+    split verifier. 
+    """
+    
+    def __init__(self, split_verifier, 
+                 max_width = 2, max_height = 32, 
+                 unroll_limit = -1, clone_limit = -1, 
+                 deepening = False, 
+                 split_line_limit = 100_000,
+                 timeout = -1,
+                 parallelization_limit = -1):
+        super().__init__(split_verifier.args, split_verifier.property)
+        self.split_verifier = split_verifier
+        self.max_width = max_width
+        self.max_height = max_height
+        self.unroll_limit = unroll_limit
+        self.clone_limit  = clone_limit
+        self.deepening     = deepening
+        self.split_line_limit = split_line_limit
+        self.split_timeout = timeout
+        self.parallelization_limit = parallelization_limit
+
+        self._fns = []
+
+    def create_task(self, inputfile: CompilationUnit) -> Task:
+        task = DynamicSplittingVerificationTask(
+            self.split_verifier, inputfile, 
+            max_width = self.max_width, 
+            max_height = self.max_height, 
+            unroll_limit = self.unroll_limit,
+            clone_limit = self.clone_limit,
+            deepening = self.deepening,
+            split_line_limit = self.split_line_limit,
+            timeout = self.split_timeout,
+            parallelization_limit=self.parallelization_limit,
+        )
+
+        for fn in self._fns:
+            task = task >> fn
+        
+        return task
+    
+    def __rshift__(self, other):
+        if not isinstance(other, SoftwareVerifier):
+            self._fns.append(other)
+            return self
+        
+        return super().__rshift__(other)
+
+
+class DynamicSplitResult(TaskResult):
+    
+    def __init__(self, output, splits = None, status = "DONE", **kwargs):
+        super().__init__(status, output, **kwargs)
+        self._splits = splits
+
+    def has_work(self):
+        return len(self.splits()) > 0
+    
+    def residuals(self):
+        return self.splits()
+    
+    def splits(self):
+        if not self._splits:
+            unknown_results = [res for res in self.output if isinstance(res.output[0], Verdict) and res.output[0].is_unknown()]
+
+            splits = []
+            for unknown_result in unknown_results:
+                assert isinstance(unknown_result.task, CheckTask), f"{unknown_result} is not a check task"
+                task = unknown_result.task
+                splits.append(task.inputfile())
+            self._splits = splits
+
+        return self._splits
+
+    def verdicts(self):
+        return TaskResult("DONE", output = [r.output[0] for r in self.output], task = self)
+
+
+class DynamicSplittingVerificationTask(ContinuationTask):
+    """
+    Task for running dynamic program splitting with the given
+    split verifier. 
+    """
+    
+    def __init__(self, split_verifier, inputfile, 
+                    max_width = 2, max_height = 32, 
+                    unroll_limit = -1, clone_limit = -1, 
+                    deepening = False, split_line_limit = 100_000, 
+                    parallelization_limit = -1,
+                    timeout = -1):
+        
+        # Run Line 1: Task on the whole program
+        super().__init__(
+            ParallelCompose(
+                [CheckTask(split_verifier, inputfile)]
+            ),
+            name = "SplitScheduler"
+        )
+        self._inputfile = inputfile
+        self._split_verifier = split_verifier
+
+        self._open_tasks      = []
+        self._executed_tasks  = set()
+
+        self._results = []
+
+        self._steps = 0
+
+        self._split_config = {
+            "splitting"  : max_width,
+            "steps_limit": max_height,
+            "loop_unrolls": unroll_limit,
+            "function_clones": clone_limit,
+            "deepening": deepening,
+            "split_line_limit": split_line_limit
+        }
+
+        self._parallelization_limit = max_width if parallelization_limit == -1 else parallelization_limit
+        self._split_timeout = timeout # Soft timeout for splitter
+
+    def _stop_splitter(self):
+
+        step_limit = self._split_config["steps_limit"]
+        if step_limit >= 0 and self._steps >= self._split_config["steps_limit"]:
+            dbg(f"[ABORT-SPLIT] Reached step limit of {step_limit} steps.", color = "green")
+            return True
+        
+        split_limit = self._split_config["splitting"]
+        if split_limit >= 0 and len(self._open_tasks) >= self._split_config["splitting"]:
+            dbg(f"[ABORT-SPLIT] Reached split limit of {split_limit} splits.", color = "green")
+            return True
+        
+        if self._split_timeout > 0:
+            current_time = clock_gettime(CLOCK_REALTIME) - self._start_time
+            if current_time >= self._split_timeout:
+                dbg(f"[ABORT-SPLIT] Reached soft timeout of {current_time:.3f} seconds.", color = "green")
+                return True
+    
+        return False
+    
+    def continuation(self, result):
+        if not result.is_done(): return result
+
+        # splits <- splits U {P_i | r_i = ?} (Line 12)
+        for task_result in result.output:
+            for sub_result in task_result.output:
+                if isinstance(sub_result, CompilationUnit):
+                    self._open_tasks.append(task_result)
+                
+                elif isinstance(sub_result, Verdict):
+                    if sub_result.is_incorrect(): 
+                        # Abort if error: if x \in results: return x, splits
+                        return DynamicSplitResult([task_result], task = self)
+                    self._results.append(task_result)
+
+        # |splits| = 0 (Line 6: First abort criterium)
+        if len(self._open_tasks) == 0:
+            # Line 14: program is correct and we are finished
+            return DynamicSplitResult(self._results, task = self)
+        
+        assert all(task.task is not None for task in self._open_tasks), f"Result {result} introduced invalid tasks"
+        
+        self._steps += 1
+
+        # stop: (Line 6: Second abort criterium)
+        if self._stop_splitter():
+            open_tasks = self._open_tasks
+            dbg("Split task into %d parts (%d parts solved in the process)" % (len(open_tasks), len(self._results)))
+            dbg("[STATS] Splits: %d" % len(open_tasks), color = "green")
+
+            open_tasks_verdicts = [
+                TaskResult("DONE", output = [
+                                            Verdict(Verdict.UNKNOWN,
+                                                     prp = self._split_verifier.property)      
+                            ], task = open_task.task)
+                for open_task in open_tasks
+            ]
+
+            return DynamicSplitResult(self._results + open_tasks_verdicts, 
+                                      splits = [t.output[0] for t in open_tasks],
+                                      task = self)
+
+        # Generalization of Line 7 - 9: Run split and verify on n tasks (default: n = 1)
+        split_check_limit = self._parallelization_limit // 2
+        exec_tasks = self._open_tasks[:split_check_limit]
+
+        parallel_tasks = [
+            SplitAndCheckTask(self._split_verifier, task.output[0], 
+                            split_config = self._split_config,
+                            split_parent = task.task)
+            if task.output[0] not in self._executed_tasks else
+            IdentityTask([task], parent_task = task.task)
+            for task in exec_tasks
+        ]
+        
+        self._open_tasks      = self._open_tasks[split_check_limit:]
+        self._executed_tasks |= set(t.output[0] for t in exec_tasks) 
+
+        return TaskResult(
+            "REPLACE_TASK",
+                ContinuationTask(
+                    ComposeResults(
+                        parallel_tasks
+                    ),
+                    continuation=self.continuation
+                )
+            )
+
+
+class ParallelCompose(AggregateTask):
+    def __init__(self, tasks):
+        super().__init__(tasks)
+        self._task_num = len(tasks)
+        self._results = []
+
+    def aggregate(self, task, result):
+        if result.is_error(): return result
+
+        if not result.is_done():
+            self._results.append(result)
+        else:
+            for r in result.output:
+                if isinstance(r, Verdict) and r.is_incorrect():
+                    return TaskResult("DONE", output=[result], task = self)
+
+                self._results.append(
+                    TaskResult("DONE", output = [r], task = result.task)
+                )
+
+        self._task_num -= 1
+        if self._task_num == 0:
+            return TaskResult("DONE", output=self._results, task = self)
+
+        # no result yet
+        return None
+
+# Split helper ---------------------------------------------------------------
+
+class IdentityTask(Task):
+
+    def __init__(self, result, parent_task = None):
+        super().__init__(name = "identity", descr = f"id('{result}')")
+        self._output = result if isinstance(result, TaskResult) else TaskResult("DONE", output = result, task = parent_task)
+
+    def execute(self):
+        pass
+    
+    def is_done(self):
+        return self._start_time is not None
+
+    def stop(self):
+        pass
+
+    def kill(self):
+        pass
+
+    def finish(self):
+        if self._result:
+            return self._result
+        
+        return self._output
+
+
+class CheckTask(ContinuationTask):
+
+    def __init__(self, split_verifier, inputfile, split_parent = None):
+        super().__init__(
+            split_verifier(inputfile),
+            name = "CheckTask"
+        )
+        self._inputfile = inputfile
+        self.split_parent = split_parent
+    
+    def inputfile(self):
+        return self._inputfile
+    
+    def continuation(self, result):
+        if not result.is_done() or task_result_is_conclusive(result):
+            return result
+
+        return TaskResult("DONE", [self._inputfile], task = self)
+    
+
+class SplitAndCheckTask(ContinuationTask):
+    def __init__(self, split_verifier, inputfile, split_config = None, split_parent = None):
+        super().__init__(
+            SplitTask(inputfile, options = split_config),
+            name = "SplitAndCont"
+        )
+        self._split_verifier = split_verifier
+        self._inputfile = inputfile
+
+        self.split_parent = split_parent
+
+    def inputfile(self):
+        return self._inputfile
+    
+    def continuation(self, result):
+        if result.is_done():
+            return TaskResult(
+                "REPLACE_TASK",
+                ParallelCompose([
+                    CheckTask(self._split_verifier, result.output[0], split_parent=self),
+                    CheckTask(self._split_verifier, result.output[1], split_parent=self),
+                ])
+            )
+
+        return TaskResult("DONE", [TaskResult("DONE", [self._inputfile], task = self)], task = self) # We are done with this file (it is atomic)
+
+
+class ComposeResults(AggregateTask):
+    def __init__(self, tasks):
+        super().__init__(tasks)
+        self.tasks = tasks
+        self._task_num = len(tasks)
+        self._results = []
+
+    def aggregate(self, task, result):
+        if not result.is_done():
+            return result
+        
+        for r in result.output:
+            if isinstance(r, Verdict) and r.is_incorrect():
+                return result
+            self._results.append(r)
+
+        self._task_num -= 1
+        if self._task_num == 0:
+            return TaskResult("DONE", output=self._results, task = self)
+
+        # no result yet
+        return None
+    
+# Join operator ----------------------------------------------------------------
+
+def _next_split_parent(task):
+    if isinstance(task, SplitAndCheckTask):
+        return task.split_parent
+
+    while task and not isinstance(task, CheckTask):
+        task = task.parent()
+    
+    if not task: return None
+    return task.split_parent
+
+
+def _split_path(task):
+    path = []
+
+    while task is not None:
+        file = task.inputfile()
+        if not path or file != path[-1].inputfile(): 
+            path.append(task)
+        task = _next_split_parent(task)
+    
+    return path
+
+
+def naive_merge_old(split_result):
+    if not split_result.is_done() or not hasattr(split_result, "splits"):
+        return split_result
+
+    splits = split_result.splits()
+    if len(splits) <= 1: return split_result
+
+    split_tasks = [res for res in split_result.output 
+                   if isinstance(res.output[0], Verdict) and res.output[0].is_unknown()]
+
+    prp = split_tasks[0].output[0].prp()
+    assert all(res.output[0].prp() == prp for res in split_tasks)
+
+    split_paths = [_split_path(task.task) for task in split_tasks]
+
+    while len(split_paths) > 1:
+        left, right = split_paths.pop(0), split_paths.pop(0)
+
+        right_files = set(r.inputfile() for r in right)
+
+        for i, l in enumerate(left):
+            if l.inputfile() in right_files:
+                split_paths.append(left[i:])
+                break
+
+    known_results = [res for res in split_result.output 
+                        if isinstance(res.output[0], Verdict) and not res.output[0].is_unknown()]
+
+    fake_result     = TaskResult("DONE", output=[Verdict(Verdict.UNKNOWN, prp = prp)], task = split_paths[0][0])
+    
+    dbg("[STATS] Merged into %d tasks" % len(split_paths), color = "green")
+    return DynamicSplitResult(output = known_results + [fake_result], splits = [split_paths[0][0].inputfile()], task = split_result.task)
+
+
+def export_residual(split_result):
+    if not split_result.is_done() or not hasattr(split_result, "splits"):
+        return split_result
+
+    result_path = f"{get_env().cwd}/residual_program.c"
+
+    splits = split_result.splits()
+    if len(splits) == 0: return split_result
+
+    if len(splits) > 1: 
+        dbg(f"Generated {len(splits)} splits. Cannot generate residual program. Try to use a merge operator.")
+        return split_result
+    
+    program_split = splits[0]
+    shutil.copy(program_split.path, result_path)
+    dbg(f"Saved residual program to {result_path}")
+    return split_result
+
+
+# Merging splits ----------------------------------------------------------------
+
+def _naive_merge_fn(original_code, left_split, right_split):
+    return original_code
+
+
+def _cpa_merge_fn(original_code, left_split, right_split, timeout = 10):
+    if program_merger is None:
+        dbg("Cannot import CPA merger. Run naive merger instead", color = "red")
+        return _naive_merge_fn(original_code, left_split, right_split)
+    
+    output_dir = pathjoin(get_env().workdir, "merges/")
+    makedirs(output_dir, exist_ok=True)
+
+    filename = basename(original_code.path)
+    base, suffix = splitext(filename)
+    output_file = pathjoin(output_dir, f"{base}-merged{suffix}")
+
+    try:
+        program_merger(
+            left_split.path,
+            right_split.path,
+            output_file,
+            timeout = timeout,
+        )
+    except ValueError as e:
+        print_stderr(str(e))
+        dbg("Cannot merge programs. Run naive merger instead", color = "red")
+        return _naive_merge_fn(original_code, left_split, right_split)
+    
+    return CompilationUnit(output_file, original_code.lang)
+
+
+def _compute_split_tree(splits):
+    child_parent = {}
+
+    worklist = [sp.task for sp in splits]
+    while len(worklist) > 0:
+        task   = worklist.pop(0)
+        parent = _next_split_parent(task)
+
+        if parent is not None:
+            child_parent[task] = parent
+            worklist.append(parent)
+    
+    parent_childs = {}
+    for child, parent in child_parent.items():
+        if parent not in parent_childs: parent_childs[parent] = []
+        parent_childs[parent].append(child)
+    
+    return parent_childs, child_parent
+
+
+def _incremental_merge(merge_fn, splits, **kwargs):
+    parent_childs, child_parent = _compute_split_tree(splits)
+    
+    root_node = None
+    merge_results = {sp.task: sp.task.inputfile() for sp in splits}
+    worklist      = list(merge_results.keys())
+
+    while len(worklist) > 0:
+        current_node = worklist.pop(0)
+
+        if current_node not in child_parent:
+            root_node = current_node
+            continue
+
+        parent_node = child_parent[current_node]
+        if parent_node in merge_results: continue
+        
+        children       = parent_childs[parent_node]
+        if not all(c in merge_results for c in children):
+            continue
+
+        merge_children = [merge_results[c] for c in children if merge_results[c] is not None]
+
+        if len(merge_children) == 0   : merge_results[parent_node] = None 
+        elif len(merge_children) == 1 : merge_results[parent_node] = merge_children[0]
+        elif len(merge_children) == 2 :
+            original_code = parent_node.inputfile()
+            merge_results[parent_node] = merge_fn(
+                original_code, *merge_children, **kwargs
+            )
+        else:
+            raise ValueError("Splitter has produced more than two children")
+        
+        worklist.append(parent_node)
+    
+    assert root_node is not None, "Cannot identify a root node"
+    return merge_results[root_node]
+
+
+def _merge_result(merge_fn, split_result, **kwargs):
+    if not split_result.is_done() or not hasattr(split_result, "splits"):
+        return split_result
+
+    splits = split_result.splits()
+    if len(splits) <= 1: return split_result
+
+    split_tasks = [res for res in split_result.output 
+                   if isinstance(res.output[0], Verdict) and res.output[0].is_unknown()]
+
+    prp = split_tasks[0].output[0].prp()
+    assert all(res.output[0].prp() == prp for res in split_tasks)
+
+    merge_path = _incremental_merge(merge_fn, split_tasks, **kwargs)
+
+    known_results = [res for res in split_result.output 
+                        if isinstance(res.output[0], Verdict) and not res.output[0].is_unknown()]
+
+    fake_result     = TaskResult("DONE", output=[Verdict(Verdict.UNKNOWN, prp = prp)])
+    
+    dbg("[STATS] Merged into 1 task" , color = "green")
+    return DynamicSplitResult(output = known_results + [fake_result], splits = [merge_path], task = split_result.task)
+
+
+def naive_merge(split_result):
+    return _merge_result(_naive_merge_fn, split_result)
+
+
+def cpa_merge(split_result):
+    return _merge_result(_cpa_merge_fn, split_result)
+
+
+# Custom CPA Merges ----------------------------------------------------------------
+
+class CPAMerge:
+
+    def __init__(self, timeout = 10):
+        self._timeout = timeout
+
+    def __call__(self, split_result):
+        return _merge_result(_cpa_merge_fn, split_result, timeout = self._timeout)
+    
+
+def create_custom_cpa_merge(timeout = 10):
+    return CPAMerge(timeout = timeout)
+
+--- FILE: ./flows/verifiers.py ---
+""" A common interface for verifiers """
+# A verifier is a tool that checks a C program for a certain property
+# Definition (verifier_type, property, resource limits)
+
+from bbk.compiler import CompilationUnit
+from bbk.properties import Property, PropertiesList
+
+from bbk.dbg import dbg
+from bbk.task.task import Task
+from bbk.task.result import TaskResult
+from bbk.task.continuationtask import ContinuationTask
+from bbk.task.aggregatetask import AggregateTask
+
+from bbk.verdict import Verdict
+
+from bbk.compiler import CompilerTask, CompilationOptions
+
+from bbk.timeout import TimeoutWatchdog
+from bbk.tools.klee import Klee, get_klee_args
+from bbk.tools.slowbeast import SlowBeast, get_slowbeast_args
+
+from bbk.tools.cbmc import Cbmc
+
+
+def found_bug(result):
+    return isinstance(result.output, list) and any(
+        (isinstance(r, Verdict) and r.is_incorrect()) for r in result.output
+    )
+
+
+def task_result_is_conclusive(result):
+    return result.is_done() and (
+        any((isinstance(r, Verdict) and r.is_incorrect() for r in result.output))
+        or all((isinstance(r, Verdict) and r.is_correct() for r in result.output))
+    )
+
+
+def is_iterable(object):
+    try:
+        for _ in object: return True
+    except Exception:
+        return False
+
+class SoftwareVerifier:
+    
+    def __init__(self, args, property, timeout = None, name = None):
+        self.args = args
+        self.property = property
+        self.timeout = timeout
+        self.name = name or self.__class__.__name__
+
+    def create_batch(self, inputfiles, **kwargs):
+        try:
+            if len(inputfiles) == 1: return self.create_task(inputfiles[0])
+        except Exception:
+            pass
+
+        tasks = [self.create_task(inputfile, **kwargs) for inputfile in inputfiles]
+        return ParallelCompositionTask(tasks)
+    
+    def create_task(self, inputfile : CompilationUnit) -> Task:
+        raise NotImplementedError("You need to define a verification task here")
+
+    def __call__(self, inputobj, **kwargs):
+        if isinstance(inputobj, TaskResult):
+            if hasattr(inputobj, 'residuals'):
+                residuals = inputobj.residuals()
+                if len(residuals) == 0: return inputobj
+                inputobj = residuals
+            else:
+                return inputobj
+
+        if is_iterable(inputobj):
+            return self.create_batch(inputobj, **kwargs)
+        
+        return self.create_task(inputobj, **kwargs)
+
+    def __rshift__(self, other):
+        return SequentialComposition([self, other])
+    
+    def __or__(self, other):
+        if isinstance(other, ParallelComposition):
+            return other.__or__(self)
+
+        return ParallelComposition([self, other])
+
+
+# Parallel composition -----------------------------
+
+class ParallelComposition(SoftwareVerifier):
+    
+    def __init__(self, verifiers, timeout = None):
+        super().__init__(verifiers[0].args, verifiers[0].property, timeout = timeout)
+        self._verifiers = verifiers
+
+    def __or__(self, other):
+        if isinstance(other, ParallelComposition):
+            others = other._verifiers
+        else:
+            others = [other]
+        
+        return ParallelComposition(self._verifiers + others)
+    
+    def create_task(self, inputfile: CompilationUnit) -> Task:
+        verification_tasks = [verifier(inputfile) for verifier in self._verifiers]
+        return ParallelCompositionTask(verification_tasks, timeout = self.timeout)
+
+
+class ParallelCompositionTask(AggregateTask):
+    def __init__(self, tasks, timeout = None):
+        super().__init__(tasks, timeout = timeout, name = "ParallelCompositionTask")
+        self._tasks = tasks
+        self._task_num = len(tasks)
+        self._results = []
+
+    def aggregate(self, task, result):
+        if not task.is_done():
+            dbg(f"{task.name()} ran into an error. Ignore result.")
+            return None
+            
+        if found_bug(result):
+            return result
+
+        self._results.append(result.output[0])
+        self._task_num -= 1
+        if self._task_num == 0:
+            return TaskResult("DONE", output=self._results, task = self)
+
+        # no result yet
+        return None
+    
+# Sequential composition ---------------------------
+
+class SequentialComposition(SoftwareVerifier):
+    
+    def __init__(self, verifiers, timeout = None):
+        super().__init__(verifiers[0].args, verifiers[0].property, timeout = timeout, name = "SequentialCompositionTask")
+        self._verifiers = verifiers
+    
+    def create_task(self, inputfile: CompilationUnit) -> Task:
+        verification_tasks = [verifier(inputfile) for verifier in self._verifiers]
+        
+        sequential_composition = verification_tasks[-1]
+        for i in range(len(verification_tasks) - 2, -1, -1):
+            sequential_composition = SequentialCompositionTask(
+                verification_tasks[i], sequential_composition
+            )
+
+        return sequential_composition
+
+
+class SequentialCompositionTask(ContinuationTask):
+    
+    def __init__(self, base_verification_task, backup_verification_task):
+        self._backup_verification_task = backup_verification_task
+        super().__init__(base_verification_task)
+        
+    def continuation(self, result):
+        if not result.is_done():
+            dbg(f"{self._task.name()} ran into an error. Continue with backup.")
+            #return result
+        
+        if task_result_is_conclusive(result):
+            return result
+        
+        return TaskResult("REPLACE_TASK", self._backup_verification_task)
+    
+    def __str__(self) -> str:
+        return f"{self._task} >> {self._backup_verification_task}"
+
+# KLEE ----------------------------------------------
+
+class KLEEVerifier(SoftwareVerifier):
+
+    def create_task(self, inputfile : CompilationUnit, check = False) -> Task:
+        return KLEEVerificationTask(self, inputfile, check = check)
+
+
+class KLEEVerificationTask(ContinuationTask):
+    
+    def __init__(self, klee_verifier : KLEEVerifier, inputfile : CompilationUnit, check = False):
+        if check:
+            compiler_task = CompileAndCheck([inputfile], PropertiesList([klee_verifier.property]))
+        else:
+            compiler_task = CompilerTask([inputfile])
+        
+        super().__init__(compiler_task, name = "KLEEVerificationTask")
+        self._verifier = klee_verifier
+
+        self._args = klee_verifier.args
+        self._property = klee_verifier.property
+        self._inputfile  = inputfile
+        self._tool_timeout = klee_verifier.timeout
+    
+    def continuation(self, result):
+        if not result.is_done():
+            return TaskResult("ERROR", output=result, descr="Compiling {self._inputfile} failed")
+
+        return TaskResult("REPLACE_TASK",
+                          Klee(result.output, 
+                               [self._property], 
+                               get_klee_args(self._args, [self._property]), 
+                               timeout=self._tool_timeout))
+
+
+def klee_failed_on_floats(result):
+    if not result.is_done():
+        return False
+
+    for r in result.output:
+        if (
+            r is not None
+            and r.is_unknown()
+            and "silently concretizing (reason: floating point)" in r.info()
+        ):
+            return True
+    return False
+
+# SlowBeast verifier ----------------------------------------------------------------
+
+class SlowBeastVerifier(SoftwareVerifier):
+
+    def create_task(self, inputfile: CompilationUnit, handle_floats = False) -> Task:
+        return SlowBeastVerificationTask(self, inputfile, handle_floats = handle_floats)
+    
+
+class SlowBeastVerificationTask(ContinuationTask):
+    def __init__(self, sb_verifier: SlowBeastVerifier, inputfile : CompilationUnit, handle_floats=False):
+        super().__init__(
+            CompileAndCheck([inputfile], PropertiesList([sb_verifier.property]), include_dirs=sb_verifier.args.I),
+            name="SlowBeastVerificationTask",
+        )
+
+        self._verifer = sb_verifier
+
+        self._args = sb_verifier.args
+        self._property = sb_verifier.property
+        self._inputfile = inputfile
+        self._tool_timeout = sb_verifier.timeout
+        self._handle_floats = handle_floats
+    
+    def continuation(self, result):
+        if not result.is_done():
+            return TaskResult(
+                "ERROR", output=result, descr="Compiling {self._inputfile} failed"
+            )
+
+        if found_bug(result):
+            return result
+        
+        self._bitcode = result.output
+
+        properties = [self._property]
+
+        if self._handle_floats:
+            args = get_slowbeast_args(self._args, properties)
+            name = "sb-se"
+        else:
+            args = get_slowbeast_args(self._args, properties, ["-bself"])
+            name = "sb-bself"
+        
+        if any((p.is_no_signed_overflow() for p in properties)) or any(
+            (p.is_valid_deref() for p in properties)
+        ):
+            # we need to recompile the input file, because KLEE used sanitizers
+            task = ContinuationTask(
+                CompileAndCheck(
+                    [self._inputfile], properties, include_dirs=self._args.I
+                ),
+                continuation=lambda result: TaskResult(
+                    "REPLACE_TASK",
+                    SlowBeast(
+                        self._bitcode,
+                        properties,
+                        args=args,
+                        name=name,
+                        timeout=self._tool_timeout,
+                    ),
+                )
+                # Compilation succeeded and bug was not found, so start verifiers
+                if result.is_done() else result,
+                descr="Compile and Start Slowbeast",
+            )
+        else:
+            task = SlowBeast(
+                self._bitcode, properties, args=args, name=name, timeout=self._tool_timeout
+            )
+
+        return TaskResult("REPLACE_TASK", task)
+
+
+class KLEESlowBeastVerifier(SlowBeastVerifier):
+
+    def create_task(self, inputfile):
+        sb_verifier = SlowBeastVerifier(
+            args = self.args, property = self.property, timeout = self.timeout
+        )
+
+        return KLEESlowBeastVerificationTask(sb_verifier, inputfile)
+
+
+class KLEESlowBeastVerificationTask(ContinuationTask):
+
+    def __init__(self, sb_verifier: SlowBeastVerifier, inputfile : CompilationUnit):
+        klee_verifier = KLEEVerifier(
+            sb_verifier.args, sb_verifier.property, timeout = 4
+        )
+        
+        super().__init__(
+            klee_verifier(inputfile),
+            name="KLEESlowBeastVerificationTask",
+        )
+
+        self._sb_verifer = sb_verifier
+        self._inputfile = inputfile
+
+    def continuation(self, result):
+        if task_result_is_conclusive(result):
+            return result
+        
+        handle_floats = klee_failed_on_floats(result)
+
+        return TaskResult("REPLACE_TASK",
+                          self._sb_verifer(self._inputfile, handle_floats = handle_floats))
+
+
+# CPAchecker ---------------------------------------------------------------------------
+
+from bbk.tools.cpachecker import CPAchecker
+
+class CPAcheckerVerifier(SoftwareVerifier):
+
+    def __init__(self, config_name, args, property, timeout = None):
+        super(CPAcheckerVerifier, self).__init__(args, property, timeout, name = "CPA_" + config_name)
+        self.config_name = config_name
+
+    def create_task(self, inputfile):
+        the_args = [f"-{self.config_name}"] 
+        if self.timeout:
+            the_args += ["-timelimit", f"{self.timeout}s"]
+        if self.args.pointer_bitwidth:
+            the_args += [f"-{self.args.pointer_bitwidth}"]
+        the_args +=  self.args.X.copy()
+        return CPAchecker([inputfile], [self.property], the_args)
+
+
+class CPAPredicateAnalysis(CPAcheckerVerifier):
+
+    def __init__(self, args, property, timeout = None):
+        super(CPAPredicateAnalysis, self).__init__("predicateAnalysis", args, property, timeout)
+
+
+class CPAkInduction(CPAcheckerVerifier):
+
+    def __init__(self, args, property, timeout = None):
+        super(CPAkInduction, self).__init__("kInduction", args, property, timeout)
+
+
+class CPASymbolicExecution(CPAcheckerVerifier):
+
+    def __init__(self, args, property, timeout = None):
+        super(CPASymbolicExecution, self).__init__("symbolicExecution", args, property, timeout)
+
+
+class CPABoundedModelChecking(CPAcheckerVerifier):
+
+    def __init__(self, args, property, timeout = None):
+        super(CPABoundedModelChecking, self).__init__("bmc", args, property, timeout)
+
+# CBMC Verifier -----------------------------------------------------------------------
+
+class CBMCVerifier(SoftwareVerifier):
+
+    def create_task(self, inputfile : CompilationUnit) -> Task:
+         return TimeoutWatchdog(
+                Cbmc([inputfile], [self.property], args = ["--unwind", "3"] + self.args.X), self.timeout
+            )
+
+# SVCOMP Verifier ----------------------------------------------------------------------
+
+from bbk.tools.svcomptool import GetSVCompTool, SVCompTool
+
+class SVCOMPVerifier(SoftwareVerifier):
+
+    def __init__(self, tool_name, args, property, timeout = None, tool_args = None):
+        super(SVCOMPVerifier, self).__init__(args, property, timeout, name = tool_name)
+        self.tool_name = tool_name
+        self.tool_args = tool_args or []
+        self.bitwidth  = args.pointer_bitwidth
+
+    def create_task(self, inputfile: CompilationUnit) -> Task:
+        return TimeoutWatchdog( GetSVCompTool(self.tool_name, [self.property], year=None)
+                    >> (
+                        lambda r: SVCompTool(
+                            self.tool_name, [inputfile], [self.property], self.tool_args, self.timeout, self.bitwidth
+                        )
+                        if r.is_done()
+                        else r
+                    ),
+                    timeout = self.timeout,
+        )
+
+
+
+# Helper tasks -------------------------------------------------------------------------
+
+class CompileAndCheck(CompilerTask):
+    def __init__(self, inputs, properties, include_dirs=None, options=None):
+        options = options or CompilationOptions()
+        if any((p.is_no_signed_overflow() for p in properties)):
+            options._sanitize.append("ubsan")
+        if any((p.is_valid_deref() for p in properties)):
+            options._sanitize.append("asan")
+
+        super().__init__(inputs, options=options, include_dirs=include_dirs)
+        self._properties = properties
+
+    def finish(self):
+        result = super().finish()
+        warnings = self.warnings()
+        if warnings:
+            overflow = self._properties.get("no-signed-overflow")
+            if overflow:
+                for line in warnings:
+                    if "warning: overflow in expression;" in line or (
+                        "implicit conversion" in line
+                        and "changes value from" in line
+                        and "to 'float'" not in line
+                    ):
+                        # This is a work-around for the problem that the translation to LLVM looses
+                        # some information -- in this case, an overflow is detected by clang, reported,
+                        # but LLVM is generated without this overflow
+                        return TaskResult(
+                            "DONE",
+                            [
+                                Verdict(
+                                    Verdict.INCORRECT,
+                                    overflow,
+                                    "Signed overflow detected",
+                                )
+                            ],
+                        )
+
+        return result
+
+
+--- FILE: ./flows/workstealing.py ---
+""" Tasks for work stealing """
+from bbk.dbg import dbg
+
+from os.path import basename
+
+from bbk.task.task import Task
+from bbk.task.aggregatetask import AggregateTask
+from bbk.task.continuationtask import ContinuationTask
+
+from bbk.compiler import CompilationUnit
+from bbk.verdict import Verdict
+
+from bbk.task.result import TaskResult
+from .verifiers import SoftwareVerifier, ParallelComposition
+from .verifiers import found_bug, task_result_is_conclusive
+
+
+class WorkStealingComposition(ParallelComposition):
+
+    def __or__(self, other):
+        if isinstance(other, ParallelComposition):
+            others = other._verifiers
+        else:
+            others = [other]
+        
+        return WorkStealingComposition(self._verifiers + others)
+
+    def create_batch(self, inputfiles):
+        return WorkStealingAlgorithm(self._verifiers, inputfiles)
+
+    def create_task(self, inputfile: CompilationUnit) -> Task:
+        return WorkStealingAlgorithm(self._verifiers, [inputfile])
+
+
+class WorkStealingResult(TaskResult):
+
+    def verdicts(self):
+        return TaskResult("DONE", output = [r.output[0] for r in self.output])
+
+
+class WorkStealingAlgorithm(AggregateTask):
+    
+    def __init__(self, verifiers, inputfiles):
+        super().__init__([], name="WorkStealingAlgorithm")
+        self._tasks = inputfiles
+        self._base_verifiers = verifiers
+        self._base_verifier_types = [v.name for v in verifiers]
+
+        self._running_verifiers = [None] * len(self._base_verifiers)
+
+        self._running_tasks = [None] * len(self._base_verifiers)
+        self._running_alloc = [None] * len(self._tasks)
+
+        self._results = [None] * len(self._tasks)
+
+    def _next_task_for(self, verifier_id):
+        # Find open tasks
+        for i, _ in enumerate(self._tasks):
+            if self._running_alloc[i] is None and self._results[i] is None:
+                return i
+        
+        # Find stealing points
+        for i, _ in enumerate(self._tasks):
+            if self._results[i] is not None: continue
+            running_alloc = self._running_alloc[i]
+            running_verifier = self._base_verifier_types[verifier_id]
+            if running_verifier in {self._base_verifier_types[vid] for vid in running_alloc}: continue
+            return i
+
+        return -1
+
+    def _alloc_task(self, verifier_id, task_id, task):
+        self._running_verifiers[verifier_id] = task_id
+        self._running_tasks[verifier_id] = task
+
+        if self._running_alloc[task_id] is None:
+            self._running_alloc[task_id] = [verifier_id]
+        else:
+            self._running_alloc[task_id].append(verifier_id)
+
+    def _stop_all_running_tasks(self, task_id):
+        for v_id, t_id in enumerate(self._running_verifiers):
+            if t_id == task_id:
+                self._running_verifiers[v_id] = None
+                self._running_tasks[v_id].stop()
+                self._running_tasks[v_id] = None
+        self._running_alloc[task_id] = None
+
+    def _create_task(self, verifier_id, task_id):
+        verifier, task = self._base_verifiers[verifier_id], self._tasks[task_id]
+        return verifier(task)
+    
+    def execute(self):
+        for verifier_id, _ in enumerate(self._base_verifiers):
+            task_id = self._next_task_for(verifier_id)
+            if task_id == -1: continue
+
+            verifier_type = self._base_verifier_types[verifier_id]
+            if self._running_alloc[task_id] is not None:
+                dbg(f"Start verifier '{verifier_type}' to steal task '{self._tasks[task_id]}'")
+            else:
+                dbg(f"Start verifier '{verifier_type}' to process task '{self._tasks[task_id]}'")
+
+            task = self._create_task(verifier_id, task_id)
+            self._alloc_task(verifier_id, task_id, task)
+            self.add_subtask(task)
+
+
+    def aggregate(self, task, result):
+        if not result.is_done() or found_bug(result): return result
+        
+        # Identify task id (hacky solution for now)
+        solver = result.task
+        task_id = -1
+        target_task = basename(solver._inputs[0])
+        for i, task_name in enumerate(self._tasks):
+            tname = basename(task_name.path)
+            if target_task.startswith(tname):
+                task_id = i
+        assert task_id != -1, target_task + " is not in " + str(self._tasks)
+
+        self._results[task_id] = result
+        self._stop_all_running_tasks(task_id)
+
+        if all(r is not None for r in self._results):
+            return WorkStealingResult("DONE", output=self._results, task = self)
+        
+        self.execute() # Reschedule the remaining tasks
+        return None
+
+    def finish(self):
+        result = self.result()
+        if result is None:
+            return WorkStealingResult("DONE", output=[TaskResult("DONE", output=[
+                                                        Verdict(Verdict.UNKNOWN, None, "No config got a result")
+                                                ])], task = self)
+        return result   
+
+--- FILE: ./flows/__init__.py ---
+
+from .split import (
+    DynamicSplittingVerifier,
+    DynamicSplittingVerificationTask,
+    naive_merge,
+    cpa_merge,
+    create_custom_cpa_merge,
+    export_residual
+)
+
+from .verifiers import (
+    KLEEVerifier,
+    KLEEVerificationTask,
+
+    SlowBeastVerifier,
+    SlowBeastVerificationTask,
+
+    KLEESlowBeastVerifier,
+    KLEESlowBeastVerificationTask,
+
+    ParallelComposition,
+    ParallelCompositionTask,
+
+    SequentialComposition,
+    SequentialCompositionTask,
+
+    CPAcheckerVerifier,
+    CPAPredicateAnalysis,
+    CPAkInduction,
+    CPABoundedModelChecking,
+    CPASymbolicExecution,
+
+    SVCOMPVerifier,
+    CBMCVerifier,
+
+    task_result_is_conclusive,
+    found_bug,
+)
+
+from .workstealing import (
+    WorkStealingComposition,
+    WorkStealingAlgorithm
+)
+
+
+--- FILE: ./fp-coop.py ---
+from bbk.compiler import CompilerTask
+from bbk.task import AggregateTask
+from bbk.timeout import TimeoutWatchdog
+
+from bbk.tools.klee import Klee, get_klee_args
+from bbk.tools.slowbeast import SlowBeast, get_slowbeast_args
+from bbk.workflow import Workflow
+
+from .default import VerificationData
+
+
+class ExtendedKLEE(AggregateTask):
+    def __init__(self, bitcode, data):
+        klee = Klee(
+            bitcode,
+            data.properties,
+            get_klee_args(data.args, data.properties) + ["-write-paths"],
+        )
+
+        super().__init__([klee])
+
+        self._results = []
+
+        def handle_unsupported_fp(event, line):
+            if b"Dumped unfinished path to file:" in line:
+                path = line.decode("utf-8").split()[7]
+                self.add_subtask(
+                    SlowBeast(
+                        bitcode,
+                        data.properties,
+                        get_slowbeast_args(data.args, data.properties)
+                        + ["-replay-path", path],
+                    )
+                )
+
+        klee.add_event_listener("line-stderr", self, handle_unsupported_fp)
+        klee.add_ignore_stderr_lines(
+            "silently concretizing (reason: floating point) expression"
+        )
+
+    def aggregate(self, task, result):
+        self._results.append(result)
+
+        if not result.is_done():
+            return result
+
+        if not result.output[0].is_correct():
+            return result
+
+        return None
+
+    def finish(self):
+        if self._aggregated_result:
+            return self._aggregated_result
+
+        # all aggregated results are 'correct'
+        return self._results[0]
+
+
+def create_init_task(programs, args, cmdargs, properties):
+    """
+    The workflow for Bubaak where SlowBeast handles killed states from KLEE
+    """
+
+    if any((not p.is_unreach() for p in properties)):
+        raise NotImplementedError("Only reachability supported ATM")
+
+    init = CompilerTask(programs, include_dirs=cmdargs.I) >> (
+        lambda result: ExtendedKLEE(
+            result.output, VerificationData(programs, properties, cmdargs)
+        )
+    )
+
+    return TimeoutWatchdog(init, cmdargs.timeout)
+
+
+def workflow(programs, args, properties):
+    return Workflow([create_init_task(programs, args, cmdargs, properties)])
+
+
+--- FILE: ./klee.py ---
+from bbk.compiler import CompilerTask
+from bbk.timeout import TimeoutWatchdog
+
+from bbk.tools.klee import Klee, get_klee_args
+from bbk.workflow import Workflow
+
+
+def create_init_task(programs, args, cmdargs, properties):
+    """
+    The workflow for Bubaak where SlowBeast handles killed states from KLEE
+    """
+
+    if any((not p.is_unreach() for p in properties)):
+        raise NotImplementedError("Only reachability supported ATM")
+
+    init = CompilerTask(programs, include_dirs=cmdargs.I) >> (
+        lambda result: Klee(
+            result.output, properties, get_klee_args(cmdargs, properties)
+        )
+    )
+
+    return TimeoutWatchdog(init, cmdargs.timeout)
+
+
+def workflow(programs, args, cmdargs, properties):
+    return Workflow([create_init_task(programs, args, cmdargs, properties)])
+
+
+--- FILE: ./scheduler.py ---
+import sys
+from os import makedirs
+from os.path import join as pathjoin, basename, splitext
+
+from bbk.compiler import CompilerTask, CompilationUnit
+from bbk.dbg import dbg
+from bbk.dbg import print_stderr
+from bbk.env import get_env
+from bbk.task.aggregatetask import AggregateTask
+from bbk.task.continuationtask import ContinuationTask
+from bbk.task.result import TaskResult
+from bbk.task.task import Task
+from bbk.timeout import TimeoutWatchdog
+from bbk.tools.klee import Klee, get_klee_args
+from bbk.tools.slowbeast import SlowBeast, get_slowbeast_args
+from bbk.verdict import Verdict
+from bbk.workflow import Workflow
+from svcomp.witness_to_harness import convert_executable_witness_to_harness
+from .default import CompileAndCheck
+from .default import found_bug, task_result_is_conclusive
+
+# import the program splitter
+sys.path.insert(0, pathjoin(get_env().srcdir, "program-splitter"))
+from split import program_splitter
+
+sys.path.pop(0)
+
+# The depth limit of the splitting tree
+STEPS_LIMIT = 4
+PARALLIZATION_LIMIT = 2
+
+# Line limit (allowed for splitting)
+SPLIT_LINE_LIMIT = 100_000
+
+# The maximal runtime of the weak verifier (KLEE)
+WEAK_VERIFIER_TIMEOUT = 8
+
+# KLEE timeout used in strong backup solver
+KLEE_TIMEOUT = 150
+
+# Calculation:
+# cputime for splitting \in O( STEPS_LIMIT * PARALLIZATION_LIMIT * WEAK_VERIFIER_TIMEOUT )
+# For a 8s timeout, approximately 64s will be spent in the splitting process.
+# Due to parallization, 300s cputime for running KLEE as strong verifier
+# Then, approximately 400 - 500s cputime available for SlowBeast (200 - 250s for each instance).
+
+# The maximal runtime of the backup (SlowBeast) solver on each split
+SPLIT_BACKUP_TIMEOUT = None
+
+
+def klee_failed_on_floats(result):
+    if not result.is_done():
+        return False
+
+    for r in result.output:
+        if (
+            r is not None
+            and r.is_unknown()
+            and "silently concretizing (reason: floating point)" in r.info()
+        ):
+            return True
+    return False
+
+
+# Weak verifier -----------------------------
+
+
+class CompileAndRunWeakVerifier(ContinuationTask):
+    def __init__(self, inputfile, args, properties, check=False):
+        if check:
+            compiler_task = CompileAndCheck([inputfile], properties)
+        else:
+            compiler_task = CompilerTask([inputfile])
+
+        super().__init__(compiler_task, name="CompileAndRunWeakVerifier")
+        self._args = args
+        self._properties = properties
+        self._inputfile = inputfile
+
+    def continuation(self, result):
+        if not result.is_done():
+            return TaskResult(
+                "ERROR", output=result, descr="Compiling {self._inputfile} failed"
+            )
+
+        return TaskResult(
+            "REPLACE_TASK",
+            Klee(
+                result.output,
+                self._properties,
+                get_klee_args(self._args, self._properties),
+                timeout=WEAK_VERIFIER_TIMEOUT,
+            ),
+        )
+
+
+# StrongVerifier ---------------------------------
+
+
+class RunStrongVerifier(ContinuationTask):
+    def __init__(self, bitcode, inputfile, args, properties, timeout=None, klee_timeout = None):
+        klee_timeout = klee_timeout or KLEE_TIMEOUT
+        super().__init__(
+            Klee(
+                bitcode,
+                properties,
+                get_klee_args(args, properties),
+                timeout=klee_timeout,
+            ),
+            name="RunStrongVerifier",
+        )
+        self._bitcode = bitcode
+        self._args = args
+        self._properties = properties
+        self._inputfile = inputfile
+        self._tool_timeout = timeout - klee_timeout if timeout else None
+
+    def continuation(self, result):
+        if task_result_is_conclusive(result):
+            return result
+
+        if self._timeout is not None and self._timeout <= 0:
+            return result
+
+        properties = self._properties
+
+        if klee_failed_on_floats(result):
+            args = get_slowbeast_args(self._args, properties)
+            name = "sb-se"
+        else:
+            args = get_slowbeast_args(self._args, properties, ["-bself"])
+            name = "sb-bself"
+
+        if any((p.is_no_signed_overflow() for p in properties)) or any(
+            (p.is_valid_deref() for p in properties)
+        ):
+            # we need to recompile the input file, because KLEE used sanitizers
+            task = ContinuationTask(
+                CompileAndCheck(
+                    [self._inputfile], properties, include_dirs=self._args.I
+                ),
+                continuation=lambda result: TaskResult(
+                    "REPLACE_TASK",
+                    SlowBeast(
+                        self._bitcode,
+                        properties,
+                        args=args,
+                        name=name,
+                        timeout=self._tool_timeout,
+                    ),
+                )
+                # Compilation succeeded and bug was not found, so start verifiers
+                if result.is_done() else result,
+                descr="Compile and Start Slowbeast",
+            )
+        else:
+            task = SlowBeast(
+                self._bitcode, properties, args=args, name=name, timeout=self._tool_timeout
+            )
+
+        return TaskResult("REPLACE_TASK", task)
+
+
+class CompileAndRunStrongVerifier(ContinuationTask):
+    def __init__(self, inputfile, args, properties, handle_floats=False, timeout=None, klee_timeout=None):
+        super().__init__(
+            CompileAndCheck([inputfile], properties, include_dirs=args.I),
+            name="CompileAndRunSlowBeast",
+        )
+        self._args = args
+        self._properties = properties
+        self._inputfile = inputfile
+        self._tool_timeout = timeout
+        self._handle_floats = handle_floats
+        self._klee_timeout = klee_timeout
+
+    def continuation(self, result):
+        if not result.is_done():
+            return TaskResult(
+                "ERROR", output=result, descr="Compiling {self._inputfile} failed"
+            )
+
+        if found_bug(result):
+            return result
+
+        properties = self._properties
+
+        if self._handle_floats:
+            return TaskResult(
+                "REPLACE_TASK",
+                SlowBeast(
+                    result.output,
+                    properties,
+                    args=get_slowbeast_args(self._args, properties),
+                    name="sb-se",
+                    timeout=self._tool_timeout,
+                ),
+            )
+
+        return TaskResult(
+            "REPLACE_TASK",
+            RunStrongVerifier(
+                result.output,
+                self._inputfile,
+                self._args,
+                self._properties,
+                timeout=self._tool_timeout,
+                klee_timeout=self._klee_timeout,
+            ),
+        )
+
+
+# Splitting ---------------------------------
+
+
+class SplitTask(Task):
+    """
+    Split the given input file.
+    """
+
+    def __init__(self, input_file, options=None):
+        super().__init__(name="splitter", descr=f"Split '{input_file}'")
+
+        self._input = input_file
+        self._outputs = None
+        self._options = options
+        self._outdir = pathjoin(get_env().workdir, "splits/")
+
+        makedirs(self._outdir, exist_ok=True)
+
+    def execute(self):
+        filename = basename(self._input.path)
+        base, suffix = splitext(filename)
+
+        outputs = [
+            pathjoin(self._outdir, f"{base}-l{suffix}"),
+            pathjoin(self._outdir, f"{base}-r{suffix}"),
+        ]
+
+        try:
+            program_splitter(
+                self._input.path,
+                outputs[0],
+                outputs[1],
+                allowed_unrolls=self._options.get("loop_unrolls", -1),
+                max_line_limit=self._options.get("split_line_limit", SPLIT_LINE_LIMIT),
+            )
+        except ValueError as e:
+            print_stderr(str(e))
+            self._result = TaskResult("ERROR", descr=str(e))
+            return
+
+        self._outputs = outputs
+
+    def is_done(self):
+        return self._outputs or self._result
+
+    def stop(self):
+        pass
+
+    def kill(self):
+        pass
+
+    def finish(self):
+        if self._result:
+            return self._result
+
+        if self._outputs:
+            return TaskResult(
+                "DONE",
+                output=[
+                    CompilationUnit(path, self._input.lang) for path in self._outputs
+                ],
+            )
+
+        return TaskResult("ERROR", descr="Splitting produced nothing")
+
+
+# Validation -----------------------------------------------
+
+
+class ConvertHarnessTask(Task):
+    """
+    Converts an executable witness to a test harness
+    """
+
+    def __init__(self, input_file, witness, options=None):
+        super().__init__(
+            name="convert-harness",
+            descr=f"Convert witness for '{input_file}' to test harness",
+        )
+
+        self._input = input_file
+        self._witness = witness
+        self._output = None
+        self._result = None
+        self._outdir = pathjoin(get_env().workdir, "harness/")
+
+        makedirs(self._outdir, exist_ok=True)
+
+    def execute(self):
+        witness_path = self._witness.path
+        harness_path = pathjoin(self._outdir, "harness.c")
+        try:
+            harness = convert_executable_witness_to_harness(witness_path)
+
+            with open(harness_path, "w") as o:
+                o.write(harness)
+
+        except ValueError as e:
+            print_stderr(str(e))
+            self._result = TaskResult("ERROR", descr=str(e))
+            return
+
+        self._output = harness_path
+
+    def is_done(self):
+        return self._output or self._result
+
+    def stop(self):
+        pass
+
+    def kill(self):
+        pass
+
+    def finish(self):
+        if self._result:
+            return self._result
+
+        if self._output:
+            return TaskResult(
+                "DONE", output=CompilationUnit(self._output, self._input.lang)
+            )
+
+        return TaskResult("ERROR", descr="Conversion to harness produced nothing")
+
+
+class ValidateViolationResultCont(ContinuationTask):
+    def __init__(self, input_file, harness, args, properties):
+        super().__init__(
+            CompileAndCheck([input_file, harness], properties=properties),
+            name="ValidateViolationResultCont",
+        )
+        self._inputfile = input_file
+        self._harness = harness
+        self._args = args
+        self._properties = properties
+
+    def continuation(self, result):
+        if not result.is_done():
+            return TaskResult(
+                "ERROR",
+                output=result,
+                descr="Compiling a harness {self._harness} with {self._inputfile} failed",
+            )
+
+        return TaskResult(
+            "REPLACE_TASK",
+            Klee(
+                result.output,
+                self._properties,
+                get_klee_args(self._args, self._properties),
+            ),
+        )
+
+
+class ValidateViolationResult(ContinuationTask):
+    def __init__(self, inputfile, witness, args, properties):
+        super().__init__(
+            ConvertHarnessTask(inputfile, witness), name="ValidateViolationResult"
+        )
+        self._inputfile = inputfile
+        self._witness = witness
+        self._args = args
+        self._properties = properties
+
+    def continuation(self, result):
+        if not result.is_done():
+            return TaskResult(
+                "ERROR",
+                output=result,
+                descr="Computing a harness for {self._inputfile} failed",
+            )
+
+        return TaskResult(
+            "REPLACE_TASK",
+            ValidateViolationResultCont(
+                self._inputfile, result.output, self._args, self._properties
+            ),
+        )
+
+
+class CheckAndValidate(ContinuationTask):
+    def __init__(self, check_task, inputfile, args, properties):
+        super().__init__(check_task, name="CheckAndValidate")
+
+        self._inputfile = inputfile
+        self._args = args
+        self._properties = properties
+
+    def continuation(self, result):
+        print(result)
+        if not result.is_done():
+            return result
+
+        if any((r.is_incorrect() for r in result.output)):
+            violation_result = next(r for r in result.output if r.is_incorrect())
+
+            witness = violation_result.witness()
+            if isinstance(witness, list):  # Multiple witnesses?
+                if len(witness) > 1:
+                    dbg("Multiple witnesses provided. Choose the first one.")
+                witness = witness[0] if len(witness) > 0 else None
+
+            if witness is None or witness.path is None:
+                # Nothing to do here. Return result
+                dbg("No witness provided. Return.")
+                return TaskResult(
+                    "ERROR",
+                    descr="Cannot confirm the violation witness as no witness was provided.",
+                )
+
+            return TaskResult(
+                "REPLACE_TASK",
+                ValidateViolationResult(
+                    self._inputfile, witness, self._args, self._properties
+                ),
+            )
+
+        return result
+
+
+# Backup solver ------------------------------------------------------
+
+
+# A backup solver for the case that splitting does not work
+class CheckWithBackup(ContinuationTask):
+    def __init__(self, check_task, backup_task):
+        super(CheckWithBackup, self).__init__(check_task, name="CheckWithBackup")
+        self._backup = backup_task
+
+    def continuation(self, result):
+        # Actually, we want to try again with the backup if we run into an error.
+        if result.is_error():
+            dbg("Splitter ran into an error. Continue with backup.")
+            # return result
+
+        if task_result_is_conclusive(result):
+            return result
+
+        return TaskResult("REPLACE_TASK", self._backup)
+
+
+# Sheduler ----------------------------------------------------------------
+
+
+class ComposeResults(AggregateTask):
+    def __init__(self, tasks, name="ComposeResults"):
+        super().__init__(tasks)
+        self._task_num = len(tasks)
+        self._results = []
+
+    def aggregate(self, task, result):
+        if not result.is_done():
+            if result.is_error():
+                return result
+            self._results.extend(result.output)
+        else:
+            for r in result.output:
+                if isinstance(r, Verdict) and r.is_incorrect():
+                    return result
+                self._results.append(r)
+
+        self._task_num -= 1
+        if self._task_num == 0:
+            return TaskResult("DONE", output=self._results)
+
+        # no result yet
+        return None
+
+
+class CheckTask(ContinuationTask):
+    def __init__(self, inputfile, args, properties, check=False):
+        super().__init__(
+            CompileAndRunWeakVerifier(inputfile, args, properties, check=check),
+            name="InitCheckTask",
+        )
+        self._inputfile = inputfile
+        self._args = args
+        self._properties = properties
+
+    def continuation(self, result):
+        if result.is_error():
+            # Failed. Propagate error:
+            return result
+
+        if task_result_is_conclusive(result):
+            # Success.
+            return result
+
+        return TaskResult("DONE", [self._inputfile])
+
+
+class SplitAndCheck(ContinuationTask):
+    def __init__(self, inputfile, args, properties):
+        super().__init__(SplitTask(inputfile), name="SplitAndCont")
+        self._inputfile = inputfile
+        self._args = args
+        self._properties = properties
+
+    def continuation(self, result):
+        if result.is_done():
+            return TaskResult(
+                "REPLACE_TASK",
+                ComposeResults(
+                    [
+                        CheckTask(
+                            result.output[0], self._args, self._properties, False
+                        ),
+                        CheckTask(
+                            result.output[1], self._args, self._properties, False
+                        ),
+                    ]
+                ),
+            )
+
+        return TaskResult("ERROR", [self._inputfile])
+
+
+class SplitScheduler(ContinuationTask):
+    def __init__(self, inputfile, args, properties):
+        super().__init__(
+            ComposeResults([CheckTask(inputfile, args, properties, check=True)]),
+            name="SplitScheduler",
+        )
+        self._inputfile = inputfile
+        self._args = args
+        self._properties = properties
+
+        self._open_tasks = []
+
+        self._results = []
+
+        self._steps = 0
+
+    def continuation(self, result):
+        if not result.is_done():
+            # Failure. Return directly
+            return result
+
+        for r in result.output:
+            if isinstance(r, Verdict):
+                if r.is_incorrect():
+                    return result
+                self._results.append(r)
+            else:
+                self._open_tasks.append(r)
+
+        if len(self._open_tasks) == 0:
+            # We are finished stop
+            return TaskResult("DONE", output=self._results)
+
+        self._steps += 1
+
+        if self._steps > STEPS_LIMIT or len(self._open_tasks) >= PARALLIZATION_LIMIT:
+            # We have reached the parallization limit
+            # Stop splitting
+            open_tasks = self._open_tasks
+            self._open_tasks = []
+            return TaskResult(
+                "REPLACE_TASK",
+                ContinuationTask(
+                    ComposeResults(
+                        [
+                            CompileAndRunStrongVerifier(
+                                task, self._args, self._properties
+                            )
+                            for task in open_tasks
+                        ]
+                    ),
+                    continuation=self.continuation,
+                ),
+            )
+
+        split_check_limit = PARALLIZATION_LIMIT // 2
+        parallel_tasks = [
+            SplitAndCheck(task, self._args, self._properties)
+            for task in self._open_tasks[:split_check_limit]
+        ]
+        self._open_tasks = self._open_tasks[split_check_limit:]
+
+        return TaskResult(
+            "REPLACE_TASK",
+            ContinuationTask(
+                ComposeResults(parallel_tasks), continuation=self.continuation
+            ),
+        )
+
+
+# Main ----------------------------------------------------------------
+
+
+def create_task(programs, args, cmdargs, properties):
+    """
+    The workflow of Bubaak-Split. We start by running a weak
+    verifier (KLEE) on the input. If the weak verifier cannot solve
+    the problem, we split the task and check the splits.
+    We continue the splitting until a fixed splitting depth is reached.
+    A backup solver (SlowBeast) is executed on the remaining parts of the program.
+    """
+
+    assert len(programs) == 1, "Multiple programs not supported by the splitter"
+
+    backup_task = CompileAndRunStrongVerifier(programs[0], cmdargs, properties)
+
+    check_task = CheckWithBackup(
+        SplitScheduler(programs[0], cmdargs, properties), backup_task
+    )
+
+    check_validate_task = CheckAndValidate(check_task, programs[0], cmdargs, properties)
+
+    return TimeoutWatchdog(check_validate_task, cmdargs.timeout)
+
+
+def workflow(programs, args, cmdargs, properties):
+    return workflow_svcomp24(programs, args, cmdargs, properties)
+
+
+def workflow_svcomp24(programs, args, cmdargs, properties):
+    return Workflow([create_task(programs, args, cmdargs, properties)])
+
+
+--- FILE: ./slowbeast.py ---
+from tempfile import mktemp
+
+from bbk.env import get_env
+from bbk.task.aggregatetask import AggregateTask
+from bbk.task.result import TaskResult
+from bbk.timeout import TimeoutWatchdog
+from bbk.tools.slowbeast import SlowBeast, get_slowbeast_args
+from bbk.workflow import Workflow
+
+
+def task_result_is_conclusive(result):
+    return result.is_done() and (
+        any((r.is_incorrect() for r in result.output))
+        or all((r.is_correct() for r in result.output))
+    )
+
+
+from .default import CompileAndCheck, VerificationData, task_result_is_conclusive
+
+
+class CooperativeSeBself(AggregateTask):
+    """
+    Start SE and BSELF in SlowBeast in parallel with cooperation.
+    """
+
+    def __init__(self, bitcode, data):
+        super().__init__([], name="CoopSlowBeast")
+        self._bitcode = bitcode
+        self.data = data
+
+    def execute(self):
+        chan = mktemp(dir=get_env().workdir, prefix="chan-")
+
+        self.add_subtask(
+            SlowBeast(
+                self._bitcode,
+                self.data.properties,
+                get_slowbeast_args(
+                    self.data.args, self.data.properties, [f"-coop-channel=w:{chan}"]
+                ),
+            )
+        )
+
+        self.add_subtask(
+            SlowBeast(
+                self._bitcode,
+                self.data.properties,
+                get_slowbeast_args(
+                    self.data.args,
+                    self.data.properties,
+                    ["-bself", f"-coop-channel=r:{chan}"],
+                ),
+            )
+        )
+
+    def aggregate(self, task, result):
+        if task_result_is_conclusive(result):
+            return result
+        return None
+
+
+def create_task(programs, args, cmdargs, properties):
+    """
+    The default workflow for Bubaak. The initial task is to compile the
+    programs into LLVM and then run LEE and SlowBeast in parallel on the
+    compiled program.
+    """
+
+    if "cooperative" in args:
+        task = CompileAndCheck(programs, properties, include_dirs=cmdargs.I) >> (
+            lambda result: CooperativeSeBself(
+                result.output, VerificationData(programs, properties, cmdargs)
+            )
+        )
+    else:
+        task = CompileAndCheck(programs, properties, include_dirs=cmdargs.I) >> (
+            lambda result: SlowBeast(
+                result.output,
+                properties,
+                args=get_slowbeast_args(cmdargs, properties, args),
+                name="SlowBeast",
+            )
+        )
+
+    return TimeoutWatchdog(task, cmdargs.timeout)
+
+
+def workflow(programs, args, cmdargs, properties):
+    return Workflow([create_task(programs, args, cmdargs, properties)])
+
+
+--- FILE: ./splitflows.py ---
+""" Workflow for configurable splitting workflows (splitflows)"""
+
+from bbk.timeout import TimeoutWatchdog
+from bbk.workflow import Workflow
+
+from bbk.dbg import dbg
+from bbk.task.result import TaskResult
+from bbk.task.continuationtask import ContinuationTask
+
+from .flows import task_result_is_conclusive
+from .flows import DynamicSplittingVerifier, naive_merge, cpa_merge, export_residual, create_custom_cpa_merge
+from .flows import KLEEVerifier, SlowBeastVerifier, KLEESlowBeastVerifier
+from .flows import WorkStealingComposition, ParallelComposition
+
+# Extra tools
+from .flows import CPAcheckerVerifier, CPAPredicateAnalysis, CPAkInduction, CPASymbolicExecution, CPABoundedModelChecking 
+from .flows import SVCOMPVerifier, CBMCVerifier
+
+STEPS_LIMIT = 4
+WEAK_VERIFIER_TIMEOUT = 4 # Make this configurable
+PARALLEL = -1
+
+# Number of unrolls until we skip
+LOOP_UNROLLS = 2
+MAX_CLONES   = 2
+
+# Line limit (allowed for splitting)
+SPLIT_LINE_LIMIT = 100_000
+
+# Split configuration ------------------------------------
+
+def _splitting_config(splitop):
+    if splitop == "split" or splitop == "split2":
+        return {"splitting": 2}
+
+    if splitop == "split0": return {"splitting": 0}
+    if splitop == "split1": return {"splitting": 1}
+    if splitop == "split4": return {"splitting": 4}
+    if splitop == "split8": return {"splitting": 8}
+
+    if splitop == "splitd" or splitop == "split2d":
+        return {"splitting": 2, "deepening": True}
+    
+    if splitop == "split4d":
+        return {"splitting": 4, "deepening": True}
+    
+    if splitop == "split8d":
+        return {"splitting": 8, "deepening": True}
+
+    if splitop == "splitinf": 
+        return {"splitting": 128, "steps_limit": 1024}
+    
+    if splitop == "split2_u2":
+        return {"splitting": 128, "loop_unrolls": 2, "function_clones": 2}
+    
+    if splitop == "split100s":
+        return {"splitting": 128, "steps_limit": 1024, 
+                "split_timeout": 100,
+                "parallel": 2}
+    
+    if splitop == "split100d":
+        return {"splitting": 128, "steps_limit": 1024, 
+                "split_timeout": 100, "deepening": True,
+                "parallel": 2}
+    
+    if splitop == "split100dx8":
+        return {"splitting": 128, "steps_limit": 1024, 
+                "split_timeout": 100, "deepening": True,
+                "parallel": 2, "split_verifier_timeout": 8}
+    
+    if splitop == "split100dx16":
+        return {"splitting": 128, "steps_limit": 1024, 
+                "split_timeout": 100, "deepening": True,
+                "parallel": 2, "split_verifier_timeout": 16}
+    
+    if splitop == "split100dx32":
+        return {"splitting": 128, "steps_limit": 1024, 
+                "split_timeout": 100, "deepening": True,
+                "parallel": 2, "split_verifier_timeout": 32}
+    
+    if splitop == "split100dx16nl":
+        return {"splitting": 128, "steps_limit": 1024, 
+                "split_timeout": 100, "deepening": True,
+                "parallel": 2, "loop_unrolls": 0, "split_verifier_timeout": 16}
+    
+    if splitop == "split100dx16nc":
+        return {"splitting": 128, "steps_limit": 1024, 
+                "split_timeout": 100, "deepening": True,
+                "parallel": 2, "function_clones": 0, "split_verifier_timeout": 16}
+    
+    if splitop == "split2x16":
+        return {"splitting": 2, "steps_limit": 1024, 
+                "split_timeout": 100, 
+                "parallel": 2, "split_verifier_timeout": 16}
+    
+    if splitop == "split4x16":
+        return {"splitting": 4, "steps_limit": 1024, 
+                "split_timeout": 100, 
+                "parallel": 2, "split_verifier_timeout": 16}
+    
+    if splitop == "split8x16":
+        return {"splitting": 8, "steps_limit": 1024,
+                "split_timeout": 100,
+                "parallel": 2, "split_verifier_timeout": 16}
+    
+    if splitop == "split100sx16":
+        return {"splitting": 128, "steps_limit": 1024, 
+                "split_timeout": 100, 
+                "parallel": 2, "split_verifier_timeout": 16}
+    
+    if splitop == "split2dx16":
+        return {"splitting": 2, "steps_limit": 1024, 
+                "split_timeout": 100, "deepening": True,
+                "parallel": 2, "split_verifier_timeout": 16}
+    
+    if splitop == "split4dx16":
+        return {"splitting": 4, "steps_limit": 1024, 
+                "split_timeout": 100, "deepening": True,
+                "parallel": 2, "split_verifier_timeout": 16}
+    
+    if splitop == "split8dx16":
+        return {"splitting": 8, "steps_limit": 1024, 
+                "split_timeout": 100, "deepening": True,
+                "parallel": 2, "split_verifier_timeout": 16}
+
+    raise ValueError("Unknown split operator: %s" % splitop)
+
+
+def get_splitting_config(splitop, cmdargs, properties):
+    split_config = _splitting_config(splitop)
+
+    split_config.update({
+        "args": cmdargs,
+        "properties": properties,
+        "steps_limit": split_config.get("steps_limit", STEPS_LIMIT),
+        "split_verifier_timeout": split_config.get("split_verifier_timeout", WEAK_VERIFIER_TIMEOUT),
+        "loop_unrolls": split_config.get("loop_unrolls", LOOP_UNROLLS),
+        "function_clones": split_config.get("function_clones", MAX_CLONES),
+        "deepening": split_config.get("deepening", False),
+        "split_line_limit": SPLIT_LINE_LIMIT,
+        "split_timeout": split_config.get("split_timeout", -1),
+        "parallel": split_config.get("parallel", PARALLEL),
+    })
+
+    return split_config
+
+# Backup solver -------------------------------------------------------
+
+# A backup solver for the case that splitting does not work
+class CheckWithBackup(ContinuationTask):
+    def __init__(self, check_task, backup_task):
+        super(CheckWithBackup, self).__init__(check_task, name="CheckWithBackup")
+        self._backup = backup_task
+
+    def continuation(self, result):
+        # Actually, we want to try again with the backup if we run into an error.
+        if result.is_error():
+            dbg("Splitter ran into an error. Continue with backup.")
+            # return result
+
+        if task_result_is_conclusive(result):
+            return result
+
+        return TaskResult("REPLACE_TASK", self._backup)
+
+
+# Split verifier ------------------------------------------------------
+
+def create_verifier(verifier_name, args, properties, timeout = None, ws = False):
+    assert len(properties) == 1
+
+    if "+" in verifier_name:
+        subverifiers = verifier_name.split("+")
+        subverifiers = [create_verifier(subv, args, properties, timeout) for subv in subverifiers]
+        return WorkStealingComposition(subverifiers) if ws else ParallelComposition(subverifiers)
+
+    if ws:
+        return WorkStealingComposition([create_verifier(verifier_name, args, properties, timeout, ws = False)])
+
+    if verifier_name == "klee":
+        return KLEEVerifier(args, properties[0], timeout = timeout)
+    
+    if verifier_name == "klee100":
+        if timeout is not None: dbg(f"Ignoring timeout of {timeout}s and use 100s instead.")
+        return KLEEVerifier(args, properties[0], timeout = 100)
+
+    if verifier_name == "sb":
+        return SlowBeastVerifier(args, properties[0], timeout=timeout)
+    
+    if verifier_name == "ksb":
+        return KLEESlowBeastVerifier(args, properties[0], timeout=timeout)
+
+    if verifier_name == "pa":
+        return CPAPredicateAnalysis(args, properties[0], timeout=timeout)
+    
+    if verifier_name == "ki":
+        return CPAkInduction(args, properties[0], timeout=timeout)
+    
+    if verifier_name == "cpase":
+        return CPASymbolicExecution(args, properties[0], timeout=timeout)
+    
+    if verifier_name == "cpabmc":
+        return CPABoundedModelChecking(args, properties[0], timeout=timeout)
+    
+    if verifier_name == "esbmc": verifier_name = "esbmc-kind"
+    if verifier_name == "bmc"  : verifier_name = "esbmc-incr"
+
+    if verifier_name in ["cpachecker", "cbmc", "uautomizer", "esbmc-kind", "esbmc-incr", "theta"]:
+        return SVCOMPVerifier(verifier_name, args, properties[0], timeout=timeout)
+
+    if verifier_name == "klee100":
+        if timeout is not None: dbg(f"Ignoring timeout of {timeout}s and use 100s instead.")
+        return KLEEVerifier(args, properties[0], timeout = 100)
+    
+    if verifier_name == "pa100":
+        if timeout is not None: dbg(f"Ignoring timeout of {timeout}s and use 100s instead.")
+        return CPAPredicateAnalysis(args, properties[0], timeout = 100)
+    
+    if verifier_name == "esbmc100":
+        if timeout is not None: dbg(f"Ignoring timeout of {timeout}s and use 100s instead.")
+        return SVCOMPVerifier("esbmc-kind", args, properties[0], timeout = 100)
+    
+    if verifier_name == "bmc100":
+        if timeout is not None: dbg(f"Ignoring timeout of {timeout}s and use 100s instead.")
+        return SVCOMPVerifier("esbmc-incr", args, properties[0], timeout = 100)
+
+    raise NotImplementedError("Unknown split verifier: %s" % verifier_name)
+
+
+def collect_results(result):
+    if result.is_done() and hasattr(result, "verdicts"):
+        return result.verdicts()
+    else:
+        return result
+    
+
+# Create dynamic splitter --------------------------------------------
+
+def create_dynamic_splitter(splitop, splitv, cmdargs, properties, mergeop = None):
+    split_config = get_splitting_config(splitop, cmdargs, properties)
+
+    if split_config["splitting"] == 0: return None
+    
+    split_verifier = create_verifier(
+        splitv, cmdargs, properties, timeout = split_config["split_verifier_timeout"]
+    )
+
+    split_scheduler = DynamicSplittingVerifier(
+        split_verifier, 
+        max_width = split_config["splitting"],
+        max_height = split_config["steps_limit"],
+        unroll_limit = split_config["loop_unrolls"],
+        clone_limit  = split_config["function_clones"],
+        deepening    = split_config["deepening"],
+        split_line_limit = split_config["split_line_limit"],
+        timeout = split_config["split_timeout"],
+        parallelization_limit = split_config["parallel"],
+    )
+
+    workflow = split_scheduler
+
+    if mergeop == "merge":
+        workflow = workflow >> create_custom_cpa_merge(20)
+    elif mergeop in ["cpamerge", "cmerge", "cmerge10"]:
+        workflow = workflow >> cpa_merge
+    elif mergeop == "cmerge20":
+        workflow = workflow >> create_custom_cpa_merge(20)
+    elif mergeop == "cmerge40":
+        workflow = workflow >> create_custom_cpa_merge(40)
+    elif mergeop == "cmerge60":
+        workflow = workflow >> create_custom_cpa_merge(60)
+
+    return workflow
+
+
+def create_backup_verifier(backup_verifiers, cmdargs, properties):
+    workflow = None
+
+    for backupv in backup_verifiers:
+        backup_verifier = create_verifier(
+            backupv, cmdargs, properties,
+            timeout = None, ws = False
+        )
+        if workflow is None:
+            workflow = backup_verifier
+        else:
+            workflow = workflow >> backup_verifier
+
+    return workflow
+
+
+# Main ----------------------------------------------------------------
+
+
+def create_task(programs, args, cmdargs, properties):
+    """
+    Create a task for a configurable splitting workflow.
+    The workflow is configured based on the workflow name. 
+    For example, to run a workflow together with klee and slowbeast,
+    the configuration should be:
+    split-klee-merge-sb
+
+    This configuration splits the program with the help of KLEE 
+    until two splits are generated. Then it merges the results
+    and executes slowbeast on the merged program.
+
+    Split options:
+        - split: Shorthand for split2
+        - split0: Skips the splitter completely
+        - split1: Never executes the splitter 
+        - split2: Stops the splitter after 2 splits are generated (or timeout)
+        - split4: Stops the splitter after 4 splits are generated (or timeout)
+        - split8: Stops the splitter after 8 splits are generated (or timeout)
+    
+    Split verifier options:
+        - klee: Executes KLEE for 4 seconds to determine splits
+        - cbmc: Executes CBMC for 4 seconds to determine splits
+        - esbmc: Executes ESBMC-kInd for 4 seconds to determine splits
+
+    Merge options:
+        - merge: Applies a hierarchical merge that select the parent in the split tree 
+                  that contains all remaining splits
+        - mp:   Does not merge and executes the verifier on all splits  
+
+    Backup verifier options:
+        - sb: Runs a single instance of SlowBeast
+        - klee: Runs a single instance of KLEE
+        - cbmc: Runs a single instance of CBMC
+        - esbmc: Runs a single instance of ESBMC-kInd
+        - cpapred: CPAchecker with Predicate Abstraction
+        - cpaki: CPAchecker with k-Induction
+        - mopsa: A single instance of MOPSA
+
+        It is possible to run multiple verifier as backup verifier. For
+        example, sb-klee would run SlowBeast and KLEE in parallel. When
+        the merge option 'mp' is selected, then the different verifiers
+        are executed on different splits (with WorkStealing). In this
+        case, it can make sense to run multiple instances of the same verifier.
+
+    """
+
+    assert len(programs) == 1, "Multiple programs not supported by the splitter"
+
+    workflow       = None
+    verifier_chain = cmdargs.workflow.split("-")
+    
+    while verifier_chain and verifier_chain[0].startswith("split"):
+        splitop, splitv, *verifier_chain = verifier_chain
+
+        mergeop = None
+        if verifier_chain[0] in ["merge", "cpamerge", "cmerge", "cmerge10", "cmerge20", "cmerge40", "cmerge60"]:
+            mergeop        = verifier_chain[0]
+            verifier_chain = verifier_chain[1:]
+        
+        split_scheduler = create_dynamic_splitter(
+            splitop, splitv, cmdargs, properties, mergeop = mergeop
+        )
+
+        if split_scheduler is None: continue
+
+        if workflow is None:
+            workflow = split_scheduler(programs[0])
+        else:
+            workflow = workflow >> split_scheduler
+
+    assert len(verifier_chain) > 0, "You need to define a backup verifier"
+
+    backup_verifier = create_backup_verifier(
+        verifier_chain, cmdargs, properties,
+    )
+
+    if workflow is None:
+        workflow = backup_verifier(programs) >> collect_results
+    else:
+        workflow = workflow >> export_residual >> backup_verifier >> collect_results
+    
+        workflow = CheckWithBackup(
+            workflow, 
+            backup_verifier(programs) >> collect_results
+        )
+
+    timeout = None
+    if cmdargs.timeout is not None:
+        timeout = cmdargs.timeout
+
+    return TimeoutWatchdog(
+        workflow,
+        timeout=timeout
+    )
+
+
+
+def workflow(programs, args, cmdargs, properties):
+    return workflow_splitflow(programs, args, cmdargs, properties)
+
+
+def workflow_splitflow(programs, args, cmdargs, properties):
+    return Workflow([create_task(programs, args, cmdargs, properties)])
+
+
+--- FILE: ./splitting.py ---
+import sys
+from os import makedirs
+from os.path import join as pathjoin, basename, splitext
+
+from bbk.compiler import CompilerTask, CompilationUnit
+from bbk.dbg import dbg
+from bbk.dbg import print_stderr
+from bbk.env import get_env
+from bbk.task.aggregatetask import AggregateTask
+from bbk.task.continuationtask import ContinuationTask
+from bbk.task.result import TaskResult
+from bbk.task.task import Task
+from bbk.timeout import TimeoutWatchdog
+from bbk.tools.klee import Klee, get_klee_args
+from bbk.tools.slowbeast import SlowBeast, get_slowbeast_args
+from bbk.workflow import Workflow
+from svcomp.witness_to_harness import convert_executable_witness_to_harness
+from .default import CompileAndCheck
+from .default import found_bug, task_result_is_conclusive
+
+# import the program splitter
+sys.path.insert(0, pathjoin(get_env().srcdir, "program-splitter"))
+from split import program_splitter
+
+sys.path.pop(0)
+
+# The depth limit of the splitting tree
+SPLIT_DEPTH_LIMIT = 4
+
+# The maximal runtime of the weak verifier (KLEE)
+WEAK_VERIFIER_TIMEOUT = 2
+
+# KLEE timeout used in strong backup solver
+KLEE_TIMEOUT = 17
+
+# The maximal runtime of the backup (SlowBeast) solver on each split
+SPLIT_BACKUP_TIMEOUT = None
+
+
+def klee_failed_on_floats(result):
+    if not result.is_done():
+        return False
+
+    for r in result.output:
+        if (
+            r is not None
+            and r.is_unknown()
+            and "silently concretizing (reason: floating point)" in r.info()
+        ):
+            return True
+    return False
+
+
+# Weak verifier -----------------------------
+
+
+class CompileAndRunWeakVerifier(ContinuationTask):
+    def __init__(self, inputfile, args, properties, check=False):
+        if check:
+            compiler_task = CompileAndCheck([inputfile], properties)
+        else:
+            compiler_task = CompilerTask([inputfile])
+
+        super().__init__(compiler_task, name="CompileAndRunWeakVerifier")
+        self._args = args
+        self._properties = properties
+        self._inputfile = inputfile
+
+    def continuation(self, result):
+        if not result.is_done():
+            return TaskResult(
+                "ERROR", output=result, descr="Compiling {self._inputfile} failed"
+            )
+
+        return TaskResult(
+            "REPLACE_TASK",
+            Klee(
+                result.output,
+                self._properties,
+                get_klee_args(self._args, self._properties),
+                timeout=WEAK_VERIFIER_TIMEOUT,
+            ),
+        )
+
+
+# StrongVerifier ---------------------------------
+
+
+class RunStrongVerifier(ContinuationTask):
+    def __init__(self, bitcode, inputfile, args, properties, timeout=None):
+        super().__init__(
+            Klee(
+                bitcode,
+                properties,
+                get_klee_args(args, properties),
+                timeout=KLEE_TIMEOUT,
+            ),
+            name="RunStrongVerifier",
+        )
+        self._bitcode = bitcode
+        self._args = args
+        self._properties = properties
+        self._inputfile = inputfile
+        self._timeout = timeout - KLEE_TIMEOUT if timeout else None
+
+    def continuation(self, result):
+        if task_result_is_conclusive(result):
+            return result
+
+        if self._timeout is not None and self._timeout <= 0:
+            return result
+
+        properties = self._properties
+
+        if klee_failed_on_floats(result):
+            args = get_slowbeast_args(self._args, properties)
+            name = "sb-se"
+        else:
+            args = get_slowbeast_args(self._args, properties, ["-bself"])
+            name = "sb-bself"
+
+        if any((p.is_no_signed_overflow() for p in properties)) or any(
+            (p.is_valid_deref() for p in properties)
+        ):
+            # we need to recompile the input file, because KLEE used sanitizers
+            task = ContinuationTask(
+                CompileAndCheck(
+                    [self._inputfile], properties, include_dirs=self._args.I
+                ),
+                continuation=lambda result: TaskResult(
+                    "REPLACE_TASK",
+                    SlowBeast(
+                        self._bitcode,
+                        properties,
+                        args=args,
+                        name=name,
+                        timeout=self._timeout,
+                    ),
+                )
+                # Compilation succeeded and bug was not found, so start verifiers
+                if result.is_done() else result,
+                descr="Compile and Start Slowbeast",
+            )
+        else:
+            task = SlowBeast(
+                self._bitcode, properties, args=args, name=name, timeout=self._timeout
+            )
+
+        return TaskResult("REPLACE_TASK", task)
+
+
+class CompileAndRunStrongVerifier(ContinuationTask):
+    def __init__(self, inputfile, args, properties, handle_floats=False, timeout=None):
+        super().__init__(
+            CompileAndCheck([inputfile], properties, include_dirs=args.I),
+            name="CompileAndRunSlowBeast",
+        )
+        self._args = args
+        self._properties = properties
+        self._inputfile = inputfile
+        self._timeout = timeout
+        self._handle_floats = handle_floats
+
+    def continuation(self, result):
+        if not result.is_done():
+            return TaskResult(
+                "ERROR", output=result, descr="Compiling {self._inputfile} failed"
+            )
+
+        if found_bug(result):
+            return result
+
+        properties = self._properties
+
+        if self._handle_floats:
+            return TaskResult(
+                "REPLACE_TASK",
+                SlowBeast(
+                    result.output,
+                    properties,
+                    args=get_slowbeast_args(self._args, properties),
+                    name="sb-se",
+                    timeout=self._timeout,
+                ),
+            )
+
+        return TaskResult(
+            "REPLACE_TASK",
+            RunStrongVerifier(
+                result.output,
+                self._inputfile,
+                self._args,
+                self._properties,
+                timeout=self._timeout,
+            ),
+        )
+
+
+# Splitting ---------------------------------
+
+
+class SplitTask(Task):
+    """
+    Split the given input file.
+    """
+
+    def __init__(self, input_file, options=None):
+        super().__init__(name="splitter", descr=f"Split '{input_file}'")
+
+        self._input = input_file
+        self._outputs = None
+        self._options = options
+        self._outdir = pathjoin(get_env().workdir, "splits/")
+
+        makedirs(self._outdir, exist_ok=True)
+
+    def execute(self):
+        filename = basename(self._input.path)
+        base, suffix = splitext(filename)
+
+        outputs = [
+            pathjoin(self._outdir, f"{base}-l{suffix}"),
+            pathjoin(self._outdir, f"{base}-r{suffix}"),
+        ]
+
+        try:
+            program_splitter(
+                self._input.path, outputs[0], outputs[1], allowed_unrolls=2
+            )
+        except ValueError as e:
+            print_stderr(str(e))
+            self._result = TaskResult("ERROR", descr=str(e))
+            return
+
+        self._outputs = outputs
+
+    def is_done(self):
+        return self._outputs or self._result
+
+    def stop(self):
+        pass
+
+    def kill(self):
+        pass
+
+    def finish(self):
+        if self._result:
+            return self._result
+
+        if self._outputs:
+            return TaskResult(
+                "DONE",
+                output=[
+                    CompilationUnit(path, self._input.lang) for path in self._outputs
+                ],
+            )
+
+        return TaskResult("ERROR", descr="Splitting produced nothing")
+
+
+class ComposeSplits(AggregateTask):
+    def __init__(self, splits, name="ComposeSplits"):
+        super().__init__(splits)
+        self._splits_num = len(splits)
+        self._results = []
+
+    def aggregate(self, task, result):
+        if not result.is_done():
+            # some split failed verification, return immediately
+            return result
+
+        if any((r.is_incorrect() for r in result.output)):
+            result.task = task
+            return result
+
+        self._results.extend(result.output)
+
+        self._splits_num -= 1
+        if self._splits_num == 0:
+            return TaskResult("DONE", output=self._results)
+
+        # no result yet
+        return None
+
+
+class SplitAndCont(ContinuationTask):
+    def __init__(self, inputfile, args, properties, depth=0):
+        super().__init__(SplitTask(inputfile), name="SplitAndCont")
+        self._inputfile = inputfile
+        self._args = args
+        self._properties = properties
+        self._depth = depth
+
+    def continuation(self, result):
+        if result.is_done():
+            return TaskResult(
+                "REPLACE_TASK",
+                ComposeSplits(
+                    [
+                        CheckAndSplit(
+                            result.output[0],
+                            self._args,
+                            self._properties,
+                            self._depth + 1,
+                        ),
+                        CheckAndSplit(
+                            result.output[1],
+                            self._args,
+                            self._properties,
+                            self._depth + 1,
+                        ),
+                    ]
+                ),
+            )
+
+        return TaskResult(
+            "REPLACE_TASK",
+            CompileAndRunStrongVerifier(
+                self._inputfile,
+                self._args,
+                self._properties,
+                timeout=SPLIT_BACKUP_TIMEOUT,
+            ),
+        )
+
+
+class CheckAndSplit(ContinuationTask):
+    def __init__(self, inputfile, args, properties, depth=0):
+        super().__init__(
+            CompileAndRunWeakVerifier(inputfile, args, properties, check=depth == 0),
+            name="CheckAndSplit",
+        )
+        self._inputfile = inputfile
+        self._args = args
+        self._properties = properties
+        self._depth = depth
+
+    def continuation(self, result):
+        if result.is_error():
+            # Failed. Propagate error:
+            return result
+
+        if task_result_is_conclusive(result):
+            # Success.
+            return result
+
+        if self._depth < SPLIT_DEPTH_LIMIT:
+            return TaskResult(
+                "REPLACE_TASK",
+                SplitAndCont(
+                    self._inputfile, self._args, self._properties, self._depth
+                ),
+            )
+
+        return TaskResult(
+            "REPLACE_TASK",
+            CompileAndRunStrongVerifier(
+                self._inputfile,
+                self._args,
+                self._properties,
+                handle_floats=klee_failed_on_floats(result),
+                timeout=SPLIT_BACKUP_TIMEOUT,
+            ),
+        )
+
+
+# Validation -----------------------------------------------
+
+
+class ConvertHarnessTask(Task):
+    """
+    Converts an executable witness to a test harness
+    """
+
+    def __init__(self, input_file, witness, options=None):
+        super().__init__(
+            name="convert-harness",
+            descr=f"Convert witness for '{input_file}' to test harness",
+        )
+
+        self._input = input_file
+        self._witness = witness
+        self._output = None
+        self._result = None
+        self._outdir = pathjoin(get_env().workdir, "harness/")
+
+        makedirs(self._outdir, exist_ok=True)
+
+    def execute(self):
+        witness_path = self._witness.path
+        harness_path = pathjoin(self._outdir, "harness.c")
+        try:
+            harness = convert_executable_witness_to_harness(witness_path)
+
+            with open(harness_path, "w") as o:
+                o.write(harness)
+
+        except ValueError as e:
+            print_stderr(str(e))
+            self._result = TaskResult("ERROR", descr=str(e))
+            return
+
+        self._output = harness_path
+
+    def is_done(self):
+        return self._output or self._result
+
+    def stop(self):
+        pass
+
+    def kill(self):
+        pass
+
+    def finish(self):
+        if self._result:
+            return self._result
+
+        if self._output:
+            return TaskResult(
+                "DONE", output=CompilationUnit(self._output, self._input.lang)
+            )
+
+        return TaskResult("ERROR", descr="Conversion to harness produced nothing")
+
+
+class ValidateViolationResultCont(ContinuationTask):
+    def __init__(self, input_file, harness, args, properties):
+        super().__init__(
+            CompileAndCheck([input_file, harness], properties=properties),
+            name="ValidateViolationResultCont",
+        )
+        self._inputfile = input_file
+        self._harness = harness
+        self._args = args
+        self._properties = properties
+
+    def continuation(self, result):
+        if not result.is_done():
+            return TaskResult(
+                "ERROR",
+                output=result,
+                descr="Compiling a harness {self._harness} with {self._inputfile} failed",
+            )
+
+        return TaskResult(
+            "REPLACE_TASK",
+            Klee(
+                result.output,
+                self._properties,
+                get_klee_args(self._args, self._properties),
+            ),
+        )
+
+
+class ValidateViolationResult(ContinuationTask):
+    def __init__(self, inputfile, witness, args, properties):
+        super().__init__(
+            ConvertHarnessTask(inputfile, witness), name="ValidateViolationResult"
+        )
+        self._inputfile = inputfile
+        self._witness = witness
+        self._args = args
+        self._properties = properties
+
+    def continuation(self, result):
+        if not result.is_done():
+            return TaskResult(
+                "ERROR",
+                output=result,
+                descr="Computing a harness for {self._inputfile} failed",
+            )
+
+        return TaskResult(
+            "REPLACE_TASK",
+            ValidateViolationResultCont(
+                self._inputfile, result.output, self._args, self._properties
+            ),
+        )
+
+
+class CheckAndValidate(ContinuationTask):
+    def __init__(self, check_task, inputfile, args, properties):
+        super().__init__(check_task, name="CheckAndValidate")
+
+        self._inputfile = inputfile
+        self._args = args
+        self._properties = properties
+
+    def continuation(self, result):
+        if not result.is_done():
+            return result
+
+        if any((r.is_incorrect() for r in result.output)):
+            violation_result = next(r for r in result.output if r.is_incorrect())
+
+            witness = violation_result.witness()
+            if witness is None or witness.path is None:
+                # Nothing to do here. Return result
+                dbg("No witness provided. Return.")
+                return result
+
+            return TaskResult(
+                "REPLACE_TASK",
+                ValidateViolationResult(
+                    self._inputfile, witness, self._args, self._properties
+                ),
+            )
+
+        return result
+
+    def stop(self):
+        super().stop()
+        print("STOPPING")
+
+
+# Backup solver ------------------------------------------------------
+
+
+# A backup solver for the case that splitting does not work
+class CheckWithBackup(ContinuationTask):
+    def __init__(self, check_task, backup_task):
+        super(CheckWithBackup, self).__init__(check_task, name="CheckWithBackup")
+        self._backup = backup_task
+
+    def continuation(self, result):
+        # Actually, we want to try again with the backup if we run into an error.
+        if result.is_error():
+            dbg("Splitter ran into an error. Continue with backup.")
+            # return result
+
+        if task_result_is_conclusive(result):
+            return result
+
+        return TaskResult("REPLACE_TASK", self._backup)
+
+
+# Main ----------------------------------------------------------------
+
+
+def create_task(programs, args, cmdargs, properties):
+    """
+    The workflow of Bubaak-Split. We start by running a weak
+    verifier (KLEE) on the input. If the weak verifier cannot solve
+    the problem, we split the task and check the splits.
+    We continue the splitting until a fixed splitting depth is reached.
+    A backup solver (SlowBeast) is executed on the remaining parts of the program.
+    """
+
+    assert len(programs) == 1, "Multiple programs not supported by the splitter"
+
+    backup_task = CompileAndRunStrongVerifier(programs[0], cmdargs, properties)
+
+    check_task = CheckWithBackup(
+        CheckAndSplit(programs[0], cmdargs, properties), backup_task
+    )
+
+    check_validate_task = CheckAndValidate(check_task, programs[0], cmdargs, properties)
+
+    return TimeoutWatchdog(check_validate_task, cmdargs.timeout)
+
+
+def workflow(programs, args, cmdargs, properties):
+    return workflow_svcomp24(programs, args, cmdargs, properties)
+
+
+def workflow_svcomp24(programs, args, cmdargs, properties):
+    return Workflow([create_task(programs, args, cmdargs, properties)])
+
+
+--- FILE: ./svcomp.py ---
+from tempfile import mktemp
+
+from bbk.compiler import CompilerTask, CompilationOptions
+from bbk.env import get_env
+from bbk.task.aggregatetask import AggregateTask
+from bbk.task.result import TaskResult
+from bbk.timeout import TimeoutWatchdog
+from bbk.tools.klee import Klee, get_klee_args
+from bbk.tools.slowbeast import SlowBeast, get_slowbeast_args
+from bbk.verdict import Verdict
+from bbk.workflow import Workflow
+
+
+def found_bug(result):
+    return isinstance(result.output, list) and any(
+        (isinstance(r, Verdict) and r.is_incorrect()) for r in result.output
+    )
+
+
+def task_result_is_conclusive(result):
+    return result.is_done() and (
+        any((r.is_incorrect() for r in result.output))
+        or all((r.is_correct() for r in result.output))
+    )
+
+
+class VerificationData:
+    def __init__(self, inputs, properties, args):
+        self.inputs = inputs
+        self.properties = properties
+        self.args = args
+
+
+class CooperativeSeBself(AggregateTask):
+    """
+    Start SE and BSELF in SlowBeast in parallel with cooperation.
+    """
+
+    def __init__(self, bitcode, data):
+        super().__init__([], name="CoopSlowBeast")
+        self._bitcode = bitcode
+        self.data = data
+
+    def execute(self):
+        chan = mktemp(dir=get_env().workdir, prefix="chan-")
+
+        self.add_subtask(
+            SlowBeast(
+                self._bitcode,
+                self.data.properties,
+                get_slowbeast_args(
+                    self.data.args, self.data.properties, [f"-coop-channel=w:{chan}"]
+                ),
+            )
+        )
+
+        self.add_subtask(
+            SlowBeast(
+                self._bitcode,
+                self.data.properties,
+                get_slowbeast_args(
+                    self.data.args,
+                    self.data.properties,
+                    ["-bself", f"-coop-channel=r:{chan}"],
+                ),
+            )
+        )
+
+    def aggregate(self, task, result):
+        if task_result_is_conclusive(result):
+            return result
+        return None
+
+    def finish(self):
+        result = self.result()
+        if result is None:
+            return TaskResult(
+                "DONE",
+                output=[Verdict(Verdict.UNKNOWN, None, "No config got a result")],
+            )
+        return result
+
+
+class CompileAndCheck(CompilerTask):
+    def __init__(self, inputs, properties, include_dirs=None, options=None):
+        options = options or CompilationOptions()
+        if any((p.is_no_signed_overflow() for p in properties)):
+            options._sanitize.append("ubsan")
+        if any((p.is_valid_deref() for p in properties)):
+            options._sanitize.append("asan")
+
+        super().__init__(inputs, options=options, include_dirs=include_dirs)
+        self._properties = properties
+
+    def finish(self):
+        result = super().finish()
+        warnings = self.warnings()
+        if warnings:
+            overflow = self._properties.get("no-signed-overflow")
+            if overflow:
+                for line in warnings:
+                    if "warning: overflow in expression;" in line or (
+                        "implicit conversion" in line
+                        and "changes value from" in line
+                        and "to 'float'" not in line
+                    ):
+                        # This is a work-around for the problem that the translation to LLVM looses
+                        # some information -- in this case, an overflow is detected by clang, reported,
+                        # but LLVM is generated without this overflow
+                        return TaskResult(
+                            "DONE",
+                            [
+                                Verdict(
+                                    Verdict.INCORRECT,
+                                    overflow,
+                                    "Signed overflow detected",
+                                )
+                            ],
+                        )
+
+        return result
+
+
+class StartTerminationVerification(AggregateTask):
+    """
+    Start KLEE and SlowBeast in parallel for verifying termination
+    """
+
+    def __init__(self, bitcode, data):
+        super().__init__([], name="StartTerminationVerification")
+        self._bitcode = bitcode
+        self.data = data
+
+    def execute(self):
+        self.add_subtask(
+            Klee(
+                self._bitcode,
+                self.data.properties,
+                get_klee_args(self.data.args, self.data.properties),
+            )
+        )
+
+        self.add_subtask(
+            SlowBeast(
+                self._bitcode,
+                self.data.properties,
+                get_slowbeast_args(self.data.args, self.data.properties),
+            )
+        )
+
+    def aggregate(self, task, result):
+        if task_result_is_conclusive(result):
+            return result
+        return None
+
+
+class StartVerificationKlee(Klee):
+    def __init__(self, bitcode, data):
+        to = data.args.timeout
+        if to is not None and to > 0:
+            klee_timeout = max(int(to / 3), 10)
+        else:
+            klee_timeout = 123
+
+        super().__init__(
+            bitcode,
+            data.properties,
+            get_klee_args(data.args, data.properties),
+            timeout=klee_timeout,
+        )
+        self._bitcode = bitcode
+        self.data = data
+
+    def klee_failed_on_floats(self):
+        for r in self.parser().killed_paths():
+            if "silently concretizing (reason: floating point)" in r.info():
+                return True
+        return False
+
+    def finish(self):
+        result = super().finish()
+        if task_result_is_conclusive(result):
+            return result
+
+        properties = self.data.properties
+
+        if self.klee_failed_on_floats():
+            args = get_slowbeast_args(self.data.args, properties)
+            task = SlowBeast(
+                self._bitcode, self.data.properties, args=args, name="sb-se"
+            )
+            return TaskResult("REPLACE_TASK", task)
+
+        if any((p.is_no_signed_overflow() for p in properties)) or any(
+            (p.is_valid_deref() for p in properties)
+        ):
+            # we need to recompile the input file, because KLEE used sanitizers
+            task = CompileAndCheck(
+                self.data.inputs,
+                self.data.properties,
+                include_dirs=self.data.args.I,
+            ) >> (
+                lambda result: CooperativeSeBself(
+                    result.output,
+                    self.data,
+                )
+            )
+        else:
+            task = CooperativeSeBself(
+                self._bitcode,
+                self.data,
+            )
+
+        return TaskResult("REPLACE_TASK", task)
+
+
+def create_task(programs, args, cmdargs, properties):
+    """
+    The default workflow for Bubaak. The initial task is to compile the
+    programs into LLVM and then run LEE and SlowBeast in parallel on the
+    compiled program.
+    """
+
+    if len(properties) == 1 and properties[0].is_termination():
+        init = CompilerTask(programs, include_dirs=cmdargs.I) >> (
+            lambda result: StartTerminationVerification(
+                result.output, VerificationData(programs, properties, cmdargs)
+            )
+        )
+    else:
+        init = CompileAndCheck(programs, properties, include_dirs=cmdargs.I) >> (
+            lambda result: TaskResult(
+                "REPLACE_TASK",
+                StartVerificationKlee(
+                    result.output, VerificationData(programs, properties, cmdargs)
+                ),
+            )
+            if result.is_done() and not found_bug(result)
+            else result
+        )
+
+    return TimeoutWatchdog(init, cmdargs.timeout)
+
+
+def workflow(programs, args, cmdargs, properties):
+    return Workflow([create_task(programs, args, cmdargs, properties)])
+
+
+--- FILE: ./svcomp24.py ---
+from tempfile import mktemp
+
+from bbk.compiler import CompilerTask, CompilationOptions
+from bbk.env import get_env
+from bbk.task.aggregatetask import AggregateTask
+from bbk.task.result import TaskResult
+from bbk.timeout import TimeoutWatchdog
+from bbk.tools.klee import Klee, get_klee_args
+from bbk.tools.slowbeast import SlowBeast, get_slowbeast_args
+from bbk.verdict import Verdict
+from bbk.workflow import Workflow
+
+
+def found_bug(result):
+    return isinstance(result.output, list) and any(
+        (isinstance(r, Verdict) and r.is_incorrect()) for r in result.output
+    )
+
+
+def task_result_is_conclusive(result):
+    return result.is_done() and (
+        any((r.is_incorrect() for r in result.output))
+        or all((r.is_correct() for r in result.output))
+    )
+
+
+class VerificationData:
+    def __init__(self, inputs, properties, args):
+        self.inputs = inputs
+        self.properties = properties
+        self.args = args
+
+
+class CooperativeSeBself(AggregateTask):
+    """
+    Start SE and BSELF in SlowBeast in parallel with cooperation.
+    """
+
+    def __init__(self, bitcode, data):
+        super().__init__([], name="CoopSlowBeast")
+        self._bitcode = bitcode
+        self.data = data
+
+    def execute(self):
+        chan = mktemp(dir=get_env().workdir, prefix="chan-")
+
+        self.add_subtask(
+            SlowBeast(
+                self._bitcode,
+                self.data.properties,
+                get_slowbeast_args(
+                    self.data.args, self.data.properties, [f"-coop-channel=w:{chan}"]
+                ),
+            )
+        )
+
+        self.add_subtask(
+            SlowBeast(
+                self._bitcode,
+                self.data.properties,
+                get_slowbeast_args(
+                    self.data.args,
+                    self.data.properties,
+                    ["-bself", f"-coop-channel=r:{chan}"],
+                ),
+            )
+        )
+
+    def aggregate(self, task, result):
+        if task_result_is_conclusive(result):
+            return result
+        return None
+
+    def finish(self):
+        result = self.result()
+        if result is None:
+            return TaskResult(
+                "DONE",
+                output=[Verdict(Verdict.UNKNOWN, None, "No config got a result")],
+            )
+        return result
+
+
+class CompileAndCheck(CompilerTask):
+    def __init__(self, inputs, properties, include_dirs=None, options=None):
+        options = options or CompilationOptions()
+        if any((p.is_no_signed_overflow() for p in properties)):
+            options._sanitize.append("ubsan")
+        if any((p.is_valid_deref() for p in properties)):
+            options._sanitize.append("asan")
+
+        super().__init__(inputs, options=options, include_dirs=include_dirs)
+        self._properties = properties
+
+    def finish(self):
+        result = super().finish()
+        warnings = self.warnings()
+        if warnings:
+            overflow = self._properties.get("no-signed-overflow")
+            if overflow:
+                for line in warnings:
+                    if "warning: overflow in expression;" in line or (
+                        "implicit conversion" in line
+                        and "changes value from" in line
+                        and "to 'float'" not in line
+                    ):
+                        # This is a work-around for the problem that the translation to LLVM looses
+                        # some information -- in this case, an overflow is detected by clang, reported,
+                        # but LLVM is generated without this overflow
+                        return TaskResult(
+                            "DONE",
+                            [
+                                Verdict(
+                                    Verdict.INCORRECT,
+                                    overflow,
+                                    "Signed overflow detected",
+                                )
+                            ],
+                        )
+
+        return result
+
+
+class StartTerminationVerification(AggregateTask):
+    """
+    Start KLEE and SlowBeast in parallel for verifying termination
+    """
+
+    def __init__(self, bitcode, data):
+        super().__init__([], name="StartTerminationVerification")
+        self._bitcode = bitcode
+        self.data = data
+
+    def execute(self):
+        self.add_subtask(
+            Klee(
+                self._bitcode,
+                self.data.properties,
+                get_klee_args(self.data.args, self.data.properties),
+            )
+        )
+
+        self.add_subtask(
+            SlowBeast(
+                self._bitcode,
+                self.data.properties,
+                get_slowbeast_args(self.data.args, self.data.properties),
+            )
+        )
+
+    def aggregate(self, task, result):
+        if task_result_is_conclusive(result):
+            return result
+        return None
+
+
+class StartVerificationKlee(Klee):
+    def __init__(self, bitcode, data):
+        to = data.args.timeout
+        if to is not None and to > 0:
+            klee_timeout = max(int(to / 3), 10)
+        else:
+            klee_timeout = 123
+
+        super().__init__(
+            bitcode,
+            data.properties,
+            get_klee_args(data.args, data.properties),
+            timeout=klee_timeout,
+        )
+        self._bitcode = bitcode
+        self.data = data
+
+    def klee_failed_on_floats(self):
+        for r in self.parser().killed_paths():
+            if "silently concretizing (reason: floating point)" in r.info():
+                return True
+        return False
+
+    def finish(self):
+        result = super().finish()
+        if task_result_is_conclusive(result):
+            return result
+
+        properties = self.data.properties
+
+        if self.klee_failed_on_floats():
+            args = get_slowbeast_args(self.data.args, properties)
+            task = SlowBeast(
+                self._bitcode, self.data.properties, args=args, name="sb-se"
+            )
+            return TaskResult("REPLACE_TASK", task)
+
+        if any((p.is_no_signed_overflow() for p in properties)) or any(
+            (p.is_valid_deref() for p in properties)
+        ):
+            # we need to recompile the input file, because KLEE used sanitizers
+            task = CompileAndCheck(
+                self.data.inputs,
+                self.data.properties,
+                include_dirs=self.data.args.I,
+            ) >> (
+                lambda result: CooperativeSeBself(
+                    result.output,
+                    self.data,
+                )
+            )
+        else:
+            task = CooperativeSeBself(
+                self._bitcode,
+                self.data,
+            )
+
+        return TaskResult("REPLACE_TASK", task)
+
+
+def create_task(programs, args, cmdargs, properties):
+    """
+    The default workflow for Bubaak. The initial task is to compile the
+    programs into LLVM and then run LEE and SlowBeast in parallel on the
+    compiled program.
+    """
+
+    if len(properties) == 1 and properties[0].is_termination():
+        init = CompilerTask(programs, include_dirs=cmdargs.I) >> (
+            lambda result: StartTerminationVerification(
+                result.output, VerificationData(programs, properties, cmdargs)
+            )
+        )
+    else:
+        init = CompileAndCheck(programs, properties, include_dirs=cmdargs.I) >> (
+            lambda result: TaskResult(
+                "REPLACE_TASK",
+                StartVerificationKlee(
+                    result.output, VerificationData(programs, properties, cmdargs)
+                ),
+            )
+            if result.is_done() and not found_bug(result)
+            else result
+        )
+
+    return TimeoutWatchdog(init, cmdargs.timeout)
+
+
+def workflow(programs, args, cmdargs, properties):
+    return Workflow([create_task(programs, args, cmdargs, properties)])
+
+
+--- FILE: ./svcomptool.py ---
+from bbk.timeout import TimeoutWatchdog
+
+from bbk.tools.svcomptool import GetSVCompTool, SVCompTool
+from bbk.workflow import Workflow
+
+
+def create_init_task(programs, args, cmdargs, properties):
+    """
+    The workflow for Bubaak that runs a sv-comp tool.
+    The tool is downloaded if used for the first time.
+    """
+
+    return TimeoutWatchdog(
+        # the continuation with SVCompTool is wrapped into lambda function because
+        # we need the constructor be called only after GetSVCompTool finished.
+        # Wrapping the constructor in the lambda function does precisely that.
+        # XXX: forbid continuations without lambda? Because this can lead to
+        # a really hard-to-find bugs
+        GetSVCompTool(args[0], properties, year=None)
+        >> (
+            lambda r: SVCompTool(
+                args[0], programs, properties, args[1:], cmdargs.timeout
+            )
+            if r.is_done()
+            else r
+        ),
+        timeout=cmdargs.timeout,
+    )
+
+
+def workflow(programs, args, cmdargs, properties):
+    return Workflow([create_init_task(programs, args, cmdargs, properties)])
+
+
+--- FILE: ./__init__.py ---
