@@ -8,5 +8,6 @@ efficient *cooperative verification* enhanced via *(active) runtime monitoring*
 of the executed verifiers to gain more control over the cooperation of tools."
 
 This repository is built upon a lot of existing work done by Marek Chalupa, mchqwerty@gmail.com.
-I am a student of Indian Institute of Technology, Delhi, attempting to improve certain parts of it
-for my B. Tech Project. Most of this is NOT my own work.
+This work can be found at https://gitlab.com/mchalupa/bubaak.I am a student of Indian Institute 
+of Technology, Delhi, attempting to improve certain parts of it for my B. Tech Project.
+Most of this is NOT my own work.
