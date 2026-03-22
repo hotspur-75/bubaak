@@ -1,0 +1,3842 @@
+-e 
+
+========================================
+FILE: ./cmdline.py
+========================================
+import argparse
+from os import getcwd
+from os.path import abspath, join, dirname
+
+from bbk.compiler import CompilationUnit
+from bbk.version import get_version
+from bbk.utils import err
+from bbk.dbg import set_debugging, warn, start_workflow_log
+from svcomp.helpers import parse_yml_input
+
+
+def create_arg_parser():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("prog", nargs="+", help="program to be analyzed")
+    parser.add_argument(
+        "-version",
+        "--version",
+        action="version",
+        version=get_version(),
+        help="Show version",
+    )
+    parser.add_argument("-dbg", action="store_true", help="write debugging messages")
+    parser.add_argument(
+        "-save-files", action="store_true", help="do not delete generated files"
+    )
+    parser.add_argument("-entry", default="main", help="entry function")
+    parser.add_argument(
+        "-cfg",
+        "-workflow",
+        default="default",
+        dest="workflow",
+        metavar="NAME_OR_FILE",
+        help="A configuration to use. May override other arguments. "
+        "The argument is either a name of the configuration (if it is named) or a file.",
+    )
+    parser.add_argument(
+        "-timeout", type=int, default=None, help="Set timeout (in seconds)"
+    )
+    parser.add_argument("-out-dir", default="sb-out", help="Directory for output files")
+    parser.add_argument("-dbgv", action="store_true", help="Shortcut for -dbg -v")
+    parser.add_argument("-dbgvv", action="store_true", help="Shortcut for -dbg -vv")
+    parser.add_argument(
+        "-exec-witness", help="Generate executable witness into the given file"
+    )
+    parser.add_argument(
+        "-harness", action="store", help="Generate test harness for found bugs"
+    )
+    parser.add_argument(
+        "-I",
+        action="append",
+        metavar="DIR",
+        help="Add an include directory (can be used multiple times)",
+    )
+    parser.add_argument(
+        "-32",
+        "--32",
+        "-m32",
+        action="store_true",
+        help="Set the bitwidth of pointers to 32 bits",
+    )
+    parser.add_argument(
+        "-64",
+        "--64",
+        action="store_true",
+        help="Set the bitwidth of pointers to 64 bits (default)",
+    )
+    parser.add_argument(
+        "-pointer-bitwidth",
+        action="store",
+        type=int,
+        help="Set the bitwidth of pointers",
+    )
+    parser.add_argument(
+        "-prp",
+        "--prp",
+        action="append",
+        metavar="PRP",
+        help="The property to check. Can be given as a keyword or .prp file with SV-COMP LTL spec.",
+    )
+
+    parser.add_argument(
+        "-D",
+        action="append",
+        metavar="OPT",
+        help="Parameter to pass to the configuration",
+    )
+
+    parser.add_argument(
+        "-X",
+        action="append",
+        metavar="OPT",
+        help="Parameter to pass to the tools ran by configuration",
+    )
+
+    parser.add_argument(
+        "-error-fn",
+        "--error-fn",
+        action="append",
+        metavar="FUN",
+        help="Set error function (can be used multiple times)",
+    )
+    parser.add_argument(
+        "-sv-comp",
+        "--sv-comp",
+        action="store_true",
+        help="Assume intput and generate output for SV-COMP",
+    )
+    parser.add_argument(
+        "-sv-comp-witness",
+        "--sv-comp-witness",
+        action="store",
+        default=f"{getcwd()}/witness.graphml",
+        help="The path to store the witness to",
+    )
+
+    return parser
+
+
+def parse_arguments():
+    parser = create_arg_parser()
+    args = parser.parse_args()
+
+    bw32 = ("32", True) in args._get_kwargs()
+    bw64 = ("64", True) in args._get_kwargs()
+
+    if args.timeout is not None and args.timeout == 0:
+        err(f"Invalid timeout: {args.timeout}")
+
+    if args.pointer_bitwidth is not None:
+        if bw32 or bw64:
+            err("Only one of -32, -64, or -pointer-bitwidth is expected")
+    else:
+        args.pointer_bitwidth = 64  # default
+
+    if bw32 and bw64:
+        err("Only one of -32, -64, or -pointer-bitwidth is expected")
+
+    if bw32:
+        # dbg("Pointer bitwidth: 32 bits")
+        args.pointer_bitwidth = 32
+
+    # map programs to absolute paths
+    cwd = getcwd()
+    args.prog = [
+        prog if prog[0] == "/" else abspath(join(cwd, prog)) for prog in args.prog
+    ]
+    if args.I:
+        args.I = [d if d[0] == "/" else abspath(join(cwd, d)) for d in args.I]
+    args.sv_comp_witness = (
+        args.sv_comp_witness
+        if args.sv_comp_witness[0] == "/"
+        else abspath(join(cwd, args.sv_comp_witness))
+    )
+
+    args.X = args.X or []
+    args.D = args.D or []
+
+    def get_D(var):
+        for d in args.D:
+            dd = d.split("=")
+            if dd[0] == var:
+                return (dd[0], dd[1] if len(dd) > 1 else None)
+        return None
+
+    def get_D_value(var):
+        x = get_D(var)
+        if isinstance(x, tuple):
+            return x[1]
+        return None
+
+    args.get_D = get_D
+    args.get_D_value = get_D_value
+
+    return args
+
+
+def setup_debugging(args):
+    if args.sv_comp:
+        args.dbgv = True
+
+    if args.dbgvv:
+        set_debugging(3)
+    elif args.dbgv:
+        set_debugging(2)
+    elif args.dbg:
+        set_debugging(1)
+
+    start_workflow_log(args)
+
+
+def get_source_files(args):
+    programs = []
+    for prog in args.prog:
+        if prog.endswith(".yml"):
+            yaml_spec = parse_yml_input(prog)
+            if yaml_spec is None:
+                raise RuntimeError(f"Failed parsing {prog}")
+            files = yaml_spec["input_files"]  # it is one file right now...
+            path = f"{(abspath(dirname(prog)))}/{files}"
+            if int(yaml_spec["options"]["data_model"][-2:]) != args.pointer_bitwidth:
+                warn(
+                    "YAML input file has different architecture: "
+                    f"{yaml_spec['options']['data_model']} != ILP{args.pointer_bitwidth}"
+                )
+            programs.append(CompilationUnit(path, yaml_spec["options"]["language"]))
+        elif prog.endswith(".c") or prog.endswith(".i"):
+            programs.append(CompilationUnit(prog, lang="C"))
+        elif prog.endswith(".bc") or prog.endswith(".ll"):
+            programs.append(CompilationUnit(prog, lang="llvm"))
+        else:
+            raise RuntimeError(f"Unsupported input file: {prog}")
+
+    return programs
+-e 
+
+========================================
+FILE: ./compiler.py
+========================================
+from os.path import join as pathjoin, basename
+
+from bbk.dbg import dbg, print_stderr
+from bbk.task import TaskResult, AggregateTask
+from bbk.tools.tooloutputparser import ToolOutputParser
+from bbk.tool import ProcessTask
+from bbk.utils import err, _popen
+
+
+class CompilationUnit:
+    def __init__(self, path, lang="C"):
+        self.path = path
+        self.lang = lang
+
+    def __repr__(self):
+        return f"CompilationUnit({self.path}, lang={self.lang})"
+
+
+def _run(cmd):
+    dbg(f"# {' '.join(cmd)}")
+    proc = _popen(cmd)
+    sout, serr = proc.communicate()
+    if proc.returncode != 0:
+        dbg(f"# command returned {proc.returncode}")
+        if sout:
+            print_stderr("stdout:")
+            print_stderr(sout.decode("utf-8"), color="red")
+        if serr:
+            print_stderr("stderr:")
+            print_stderr(serr.decode("utf-8"), color="red")
+        err(f"command returned {proc.returncode}")
+    dbg(sout.decode("utf-8") if sout else "")
+    dbg(serr.decode("utf-8") if serr else "")
+
+    return sout, serr
+
+
+UBSAN_FLAGS = ["-fsanitize=signed-integer-overflow", "-fsanitize=shift"]
+ASAN_FLAGS = ["-Xclang", "-fsanitize-address-use-after-scope"]
+
+
+class CompilationOptions:
+    def __init__(self):
+        self._cflags = []
+        self._cppflags = []
+        self._compiler_defs = []
+        self._sanitize = []
+
+
+class CompileUnitTask(ProcessTask):
+    """
+    Compile given programs and possibly catch warnings from the compiler.
+    The result are compiled programs into LLVM, one LLVM bitcode made by
+    linking all programs, and possibly a set of warnings.
+    """
+
+    def __init__(self, input_file, options):
+        super().__init__(name=f"Compile {input_file}")
+
+        self._input = input_file
+        self._bitcode = None
+        self._options = options
+
+        _sanitize = self._options._sanitize
+        args = self._options._compiler_defs
+        if "asan" in _sanitize or "memory" in _sanitize:
+            args.extend(ASAN_FLAGS)
+        if "ubsan" in _sanitize or "undef" in _sanitize:
+            args.extend(UBSAN_FLAGS)
+
+        assert self._input, "No input files"
+        assert self._input.lang == "C", self._input
+
+        self._warnings_and_errors = []
+
+        def __parse_stderr(event, line):
+            assert event == "line-stderr", event
+            if b"warning" in line or b"error" in line:
+                self._warnings_and_errors.append(line.decode("utf-8"))
+
+        self.add_event_listener("line-stderr", self, __parse_stderr)
+
+    def warnings_and_errors(self):
+        return self._warnings_and_errors
+
+    def cmd(self):
+        cu = self._input
+        assert cu.lang == "C"
+        dbg(f"## compiling {cu}")
+
+        path = cu.path
+        bitcode = pathjoin(self._env.workdir, basename(path) + ".bc")
+
+        self._bitcode = bitcode
+
+        cflags = [
+            "-D__inline=",
+            "-fgnu89-inline",
+            "-Xclang",
+            "-disable-O0-optnone",
+            "-fno-vectorize",
+            "-fno-slp-vectorize",
+            "-finline-functions",
+        ] + self._options._cflags
+        cppflags = self._options._cppflags
+
+        cmd = (
+            ["clang", "-emit-llvm", "-c", "-g"]
+            + cflags
+            + cppflags
+            + ["-o", self._bitcode, path]
+            + self._options._compiler_defs
+        )
+
+        return cmd
+
+    def finish(self):
+        result = super().finish()
+        if result.status == "DONE":
+            return TaskResult("DONE", output=self._bitcode)
+        return result
+
+        # dbg(f"## compiled to {outp}")
+
+        # bad_lines = []
+        # if not warnings:
+        #    return outp, []
+
+        # for line in map(str, serr.splitlines()):
+        #    for fail in warnings:
+        #        if fail in line:
+        #            bad_lines.append(line)
+
+        # return outp, bad_lines
+
+
+class LinkingTask(ProcessTask):
+    def __init__(self, input_files, options):
+        super().__init__()
+
+        assert all((f is not None for f in input_files)), input_files
+
+        self._input = input_files.copy()
+        self._bitcode = None
+        self._options = options
+
+        assert self._input, self._input
+
+    def finish(self):
+        result = super().finish()
+        if result.status == "DONE":
+            return TaskResult("DONE", output=self._bitcode)
+        return result
+
+    def cmd(self):
+        outd = self._env.workdir
+        outp = pathjoin(outd, "code.bc")
+        self._bitcode = outp
+
+        assert outp not in self._input, self._input
+        cmd = ["llvm-link", "-o", outp] + self._input
+
+        return cmd
+
+
+# class OptTask(ProcessTask):
+#     def _opt(self, path, opts=None, outp=None, outd="/tmp/"):
+#         dbg(f"Optimizing {path}")
+
+#         if outp is None:
+#             outp = pathjoin(outd, "optcode.bc")
+
+#         cmd = ["opt", "-o", outp, path] + (opts or [])
+#         _run(cmd)
+
+#         dbg(f"Optimized files to {outp}")
+
+#         return outp
+
+
+class CompileFilesTask(AggregateTask):
+    def __init__(self, inputs, options=None):
+        super().__init__([])
+
+        if not inputs:
+            raise RuntimeError(f"No input files to the compilation task {self}")
+
+        self._options = options or CompilationOptions()
+        self._output_files = []
+        self._bitcode = None
+        self._warnings = []
+        self._inputs = inputs
+
+        _sanitize = self._options._sanitize
+        if "asan" in _sanitize or "memory" in _sanitize:
+            self.compile_argument(ASAN_FLAGS)
+        if "ubsan" in _sanitize or "undef" in _sanitize:
+            self.compile_argument(UBSAN_FLAGS)
+
+    def output_files(self):
+        return self._output_files
+
+    def warnings(self):
+        return self._warnings
+
+    def execute(self):
+        for cu in self._inputs:
+            if cu.lang == "llvm":
+                self._output_files.append(cu.path)
+            elif cu.lang == "C":
+                self.add_subtask(CompileUnitTask(cu, self._options))
+            else:
+                raise RuntimeError(f"Unsupported unit to compile: {cu}")
+
+    def compile_argument(self, args):
+        self._options._compiler_defs.extend(args)
+
+    def cflags_append(self, flag):
+        self._options._cflags.append(flag)
+
+    def cppflags_append(self, flag):
+        self._options._cflags.append(flag)
+
+    def add_include_dirs(self, *args):
+        for d in args:
+            if d.startswith("-I"):
+                self._options._cppflags.append(d)
+            else:
+                self._options._cppflags.append(f"-I{d}")
+
+    def finish(self):
+        # no sub-task failed, so we're done
+        return TaskResult("DONE", output=self._output_files)
+
+    def aggregate(self, task, result):
+        self._warnings.extend(task.warnings_and_errors())
+
+        if result.status != "DONE":
+            return result
+
+        assert task._bitcode is not None
+        self._output_files.append(task._bitcode)
+
+        return None
+
+
+class CompilerTask(CompileFilesTask):
+    def __init__(self, inputs, options=None, include_dirs=None):
+        super().__init__(inputs, options=options)
+        if include_dirs:
+            self.add_include_dirs(include_dirs)
+
+    def finish(self):
+        super().finish()
+
+        outfiles = self.output_files()
+        if len(outfiles) > 1:
+            return TaskResult(
+                "REPLACE_TASK", output=LinkingTask(outfiles, self._options)
+            )
+        elif len(outfiles) == 0:
+            return TaskResult("ERROR", descr="Compilation failed")
+        return TaskResult("DONE", outfiles[0])
+-e 
+
+========================================
+FILE: ./dbg.py
+========================================
+import sys
+
+from bbk.env import get_env
+
+COLORS = {
+    "dark_blue": "\033[0;34m",
+    "dark_green": "\033[0;32m",
+    "cyan": "\033[0;36m",
+    "blue": "\033[1;34m",
+    "purple": "\033[0;35m",
+    "red": "\033[1;31m",
+    "wine": "\033[0;31m",
+    "green": "\033[1;32m",
+    "brown": "\033[0;33m",
+    "yellow": "\033[1;33m",
+    "white": "\033[1;37m",
+    "gray": "\033[0;37m",
+    "dark_gray": "\033[1;30m",
+    "dark_gray_thin": "\033[38;5;238m",
+    "orange": "\033[38;5;214m",
+    "orangebg": "\033[1;43m",
+    "greenbg": "\033[1;42m",
+    "redbg": "\033[1;41m",
+    "orangeul": "\033[1;4;33m",
+    "greenul": "\033[1;4;32m",
+    "redul": "\033[1;4;31m",
+    "reset": "\033[0m",
+}
+
+_global_prefix = None
+
+
+def inc_print_indent():
+    global _global_prefix
+    _global_prefix = "  " + (_global_prefix or "")
+
+
+def dec_print_indent():
+    global _global_prefix
+    _global_prefix = _global_prefix[2:]
+    if not _global_prefix:
+        _global_prefix = None
+
+
+def print_stream(msg, stream, prefix=None, print_ws="\n", color=None):
+    """
+    Print message to stderr/stdout
+
+    @ msg      : str    message to print
+    @ prefix   : str    prefix for the message
+    @ print_nl : bool  print new line after the message
+    @ color    : str    color to use when printing, default None
+    """
+
+    # don't print color when the output is redirected
+    # to a file
+    if not stream.isatty():
+        color = None
+
+    if color is not None:
+        stream.write(COLORS[color.lower()])
+
+    if msg == "":
+        return
+    if prefix is not None:
+        stream.write(prefix)
+    if _global_prefix is not None:
+        stream.write(_global_prefix)
+
+    stream.write(msg)
+
+    if color is not None:
+        stream.write(COLORS["reset"])
+
+    if print_ws:
+        stream.write(print_ws)
+
+    stream.flush()
+
+
+def print_stderr(msg, prefix=None, print_ws="\n", color=None):
+    print_stream(msg, sys.stderr, prefix, print_ws, color)
+
+
+def print_stdout(msg, prefix=None, print_ws="\n", color=None):
+    print_stream(msg, sys.stdout, prefix, print_ws, color)
+
+
+def print_highlight(s, words, prefix=None, stream=sys.stdout):
+    """Words: dictionary words -> colors"""
+    if prefix:
+        print_stream(prefix, print_ws=None, stream=stream)
+    for w in s.split():
+        c = words.get(w)
+        if c:
+            print_stream(w, color=c, print_ws=" ", stream=stream)
+        else:
+            print_stream(w, print_ws=" ", stream=stream)
+    stream.write("\n")
+
+
+_is_debugging = 0
+_debugging_prefix = ""
+
+
+def set_debugging(verbose_lvl=1):
+    global _is_debugging
+    _is_debugging = verbose_lvl
+
+
+def unset_debugging():
+    global _is_debugging
+    _is_debugging = 0
+
+
+def set_debugging_prefix(prefix=""):
+    global _debugging_prefix
+    _debugging_prefix = prefix
+
+
+def get_debugging_prefix():
+    global _debugging_prefix
+    return _debugging_prefix
+
+
+def inc_debugging_lvl():
+    global _debugging_prefix
+    _debugging_prefix = "  " + _debugging_prefix
+
+
+def dec_debugging_lvl():
+    global _debugging_prefix
+    if _debugging_prefix.startswith("  "):
+        _debugging_prefix = _debugging_prefix[2:]
+
+
+def dbg(msg, print_ws="\n", color="GRAY", fn=print_stderr):
+    if _is_debugging < 1:
+        return
+
+    fn(msg, f"{_debugging_prefix}", print_ws, color)
+
+
+def dbgv(msg, verbose_lvl=2, print_ws="\n", color="GRAY", fn=print_stderr):
+    if _is_debugging < verbose_lvl:
+        return
+
+    fn(msg, f"{_debugging_prefix}", print_ws, color)
+
+
+def warn(msg, print_ws="\n", color="BROWN"):
+    print_stderr(msg, "WARNING: ", print_ws, color)
+
+
+class WorkflowDbg:
+    """Specialized debugging class for workflows"""
+
+    def __init__(self, args):
+        self._args = args
+        self._log_path = f"{get_env().workdir}/bubaak-workflows.log"
+        log = open(self._log_path, "w")
+        log.write(f"digraph Workflows {{\n")
+        self._log = log
+
+    def __del__(self):
+        if self._log:
+            self._log.write("\n}\n")
+            self._log.close()
+        if self._args.save_files:
+            dbgv(f"Workflows log: {self._log_path}")
+        del self
+
+    def dbg(self, msg, *args, **kwargs):
+        log = self._log
+        log.write("  // ")
+        log.write(msg)
+        log.write("\n")
+
+    def msg(self, msg, *args, **kwargs):
+        self.dbg(msg, *args, *kwargs)
+        dbgv(msg, verbose_lvl=3, *args, **kwargs)
+
+    def listens_to(self, task1, task2, *args, **kwargs):
+        dbgv(f"  {task1} listens to {task2}", verbose_lvl=3, *args, **kwargs)
+        self._log.write(f"{task1} -> {task2}\n")
+
+    def replaces(self, task1, task2, *args, **kwargs):
+        dbgv(f"  {task1} replaces {task2}", verbose_lvl=3, *args, **kwargs)
+        self._log.write(f'{task1} -> {task2}[penwidth=3, color=red,label="replaces"]\n')
+
+    def result(self, task, res, *args, **kwargs):
+        dbgv(f"  {task} -> {res}", verbose_lvl=3, *args, **kwargs)
+        self._log.write(f'RESULT{id(res)}[shape=underline,label="{res}"]\n')
+        self._log.write(f'{task} -> RESULT{id(res)}[color=green,label="result"]\n')
+
+
+_wdbg = None
+
+
+def start_workflow_log(args):
+    global _wdbg
+    _wdbg = WorkflowDbg(args)
+
+
+def wdbg():
+    global _wdbg
+    return _wdbg
+-e 
+
+========================================
+FILE: ./env.py
+========================================
+from os import chdir, getcwd, environ
+from os.path import abspath, dirname
+from shutil import rmtree
+from tempfile import mkdtemp
+from time import clock_gettime, CLOCK_REALTIME
+
+
+class Environment:
+    def __init__(self):
+        self.workdir = None
+        self.srcdir = None
+        self.cwd = None
+        self.start_time = None
+
+
+_global_env = None
+
+
+def get_env():
+    global _global_env
+    assert _global_env
+    return _global_env
+
+
+def init_env(bubaak_path):
+    global _global_env
+    assert _global_env is None
+    _global_env = Environment()
+    _global_env.start_time = clock_gettime(CLOCK_REALTIME)
+    _global_env.cwd = getcwd()
+    _global_env.srcdir = abspath(dirname(bubaak_path))
+    _global_env.workdir = mkdtemp(dir="/tmp/", prefix="bubaak.")
+
+    if "LD_LIBRARY_PATH" in environ:
+        environ[
+            "LD_LIBRARY_PATH"
+        ] = f"{_global_env.srcdir}/lib:{environ['LD_LIBRARY_PATH']}"
+    else:
+        environ["LD_LIBRARY_PATH"] = f"{_global_env.srcdir}/lib"
+
+
+def cleanup_env():
+    chdir("/tmp")
+    rmtree(get_env().workdir)
+
+
+def change_to_env():
+    env = get_env()
+    chdir(env.workdir)
+-e 
+
+========================================
+FILE: ./poller.py
+========================================
+from fcntl import fcntl, F_SETFL, F_GETFL
+from os import O_NONBLOCK
+from select import poll, POLLIN
+
+
+def _set_non_blocking(fd):
+    fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK)
+
+
+class Poller:
+    def __init__(self):
+        self._poll = poll()
+        self._monitored_fds = set()
+        self._data = {}
+        self._tasks = []
+
+    def add_fd(self, fd, data):
+        _set_non_blocking(fd)
+
+        self._poll.register(fd, POLLIN)
+        self._data[fd] = data
+        self._monitored_fds.add(fd)
+
+    def remove_fd(self, fd):
+        assert fd in self._monitored_fds
+        self._poll.unregister(fd)
+        self._monitored_fds.remove(fd)
+        self._data[fd] = None
+
+    def remove_all_fds(self):
+        for fd in self._monitored_fds.copy():
+            self.remove_fd(fd)
+
+    def get_data(self, fd):
+        return self._data[fd]
+
+    def add_task(self, task):
+        if task.is_program():
+            fdout, fderr = task.fds()
+            self.add_fd(fdout, (task, "stdout"))
+            self.add_fd(fderr, (task, "stderr"))
+        else:
+            raise NotImplementedError("Other types of tasks not implemented yet")
+        self._tasks.append(task)
+
+    def remove_task(self, task):
+        if task.is_program():
+            fdout, fderr = task.fds()
+            self.remove_fd(fdout)
+            self.remove_fd(fderr)
+        else:
+            raise NotImplementedError("Other types of tasks not implemented yet")
+        self._tasks.remove(task)
+
+    def poll(self, timeout=None):
+        return self._poll.poll(timeout)
+
+    def __bool__(self):
+        return len(self._monitored_fds) > 0
+-e 
+
+========================================
+FILE: ./properties.py
+========================================
+from bbk.dbg import print_stderr
+
+PRP_UNREACH_KEY = "unreach"
+PRP_VALID_DEREF_KEY = "valid-deref"
+PRP_VALID_FREE_KEY = "valid-free"
+PRP_NO_MEMLEAK_KEY = "no-memleak"
+PRP_VALID_MEMCLEANUP = "memcleanup"
+PRP_NO_SIGNED_OVERFLOW_KEY = "no-signed-overflow"
+PRP_DEF_BEHAVIOR_KEY = "def-behavior"
+PRP_TERMINATION_KEY = "termination"
+
+
+class Property:
+    """
+    Class representing a checked property of a program
+    """
+
+    def __init__(self, key):
+        self._key = key
+
+    def is_unreach(self):
+        return self.key() == PRP_UNREACH_KEY
+
+    def is_valid_deref(self):
+        return self.key() == PRP_VALID_DEREF_KEY
+
+    def is_valid_free(self):
+        return self.key() == PRP_VALID_FREE_KEY
+
+    def is_no_memleak(self):
+        return self.key() == PRP_NO_MEMLEAK_KEY
+
+    def is_memcleanup(self):
+        return self.key() == PRP_VALID_MEMCLEANUP
+
+    def is_memsafety(self):
+        return self.key() in (
+            PRP_VALID_FREE_KEY,
+            PRP_VALID_DEREF_KEY,
+            PRP_NO_MEMLEAK_KEY,
+        )
+
+    def is_no_signed_overflow(self):
+        return self.key() == PRP_NO_SIGNED_OVERFLOW_KEY
+
+    def is_def_behavior(self):
+        return self.key() == PRP_DEF_BEHAVIOR_KEY
+
+    def is_termination(self):
+        return self.key() == PRP_TERMINATION_KEY
+
+    def descr(self):
+        """Human-readable description of the property"""
+        return self.__doc__
+
+    def key(self):
+        """A unique key representing the property"""
+        return self._key
+
+
+class PropertyUnreach(Property):
+    """specified calls are not reachable"""
+
+    def __init__(self, error_fns=None):
+        super().__init__(PRP_UNREACH_KEY)
+        self._error_funs = error_fns
+
+    def error_funs(self):
+        return self._error_funs
+
+    def set_error_funs(self, fns):
+        self._error_funs = fns
+
+    def descr(self):
+        if not self._error_funs:
+            return super().descr()
+        return f" calls to {', '.join(self.error_funs())} are unreachable"
+
+
+class PropertyValidDeref(Property):
+    """all memory dereferences in the program are valid"""
+
+    def __init__(self):
+        super().__init__(PRP_VALID_DEREF_KEY)
+
+
+class PropertyValidFree(Property):
+    """all memory deallocations  are valid"""
+
+    def __init__(self):
+        super().__init__(PRP_VALID_FREE_KEY)
+
+
+class PropertyNoMemleak(Property):
+    """all allocated memory is properly traced till the end of the program"""
+
+    # (the memory may be unfreed when program exits, though)
+
+    def __init__(self):
+        super().__init__(PRP_NO_MEMLEAK_KEY)
+
+
+class PropertyMemcleanup(Property):
+    """all allocated memory is propertly freed"""
+
+    def __init__(self):
+        super().__init__(PRP_VALID_MEMCLEANUP)
+
+
+class PropertyNoSignedOverflow(Property):
+    """no signed-integer operation can overflow"""
+
+    def __init__(self):
+        super().__init__(PRP_NO_SIGNED_OVERFLOW_KEY)
+
+
+class PropertyDefBehavior(Property):
+    """program contains no undefined behavior"""
+
+    def __init__(self):
+        super().__init__(PRP_DEF_BEHAVIOR_KEY)
+
+
+class PropertyTermination(Property):
+    """program terminates"""
+
+    def __init__(self):
+        super().__init__(PRP_TERMINATION_KEY)
+
+
+supported_properties = {
+    PRP_UNREACH_KEY: PropertyUnreach,
+    PRP_VALID_DEREF_KEY: PropertyValidDeref,
+    PRP_VALID_FREE_KEY: PropertyValidFree,
+    PRP_NO_MEMLEAK_KEY: PropertyNoMemleak,
+    PRP_VALID_MEMCLEANUP: PropertyMemcleanup,
+    PRP_NO_SIGNED_OVERFLOW_KEY: PropertyNoSignedOverflow,
+    PRP_DEF_BEHAVIOR_KEY: PropertyDefBehavior,
+    PRP_TERMINATION_KEY: PropertyTermination,
+}
+
+
+def get_properties(args):
+    ret = PropertiesList()
+    if args.prp is None:
+        ret.append(PropertyUnreach(error_fns=["__assert_fail"]))
+        return ret
+
+    prps = set()
+    for prp in args.prp:
+        if prp not in supported_properties:
+            print_stderr("----------------")
+            print_stderr("Supported properties:")
+            for key, p in supported_properties.items():
+                print_stderr(f"  - {key: <20}: {p.__doc__}")
+            raise RuntimeError(f"Unsupported property: {prp}")
+
+        p = supported_properties[prp]()
+        prps.add(p)
+
+        if p.is_unreach():
+            p.set_error_funs(args.error_fn or ["__assert_fail"])
+
+    ret.extend(prps)
+    return ret
+
+
+class PropertiesList(list):
+    def get(self, key):
+        for item in self:
+            if key == item.key():
+                return item
+        return None
+
+
+class PropertiesSet:
+    """
+    A wrapper around multiple properties for easily handling them
+    """
+
+    def __init__(self, *props):
+        if not props:
+            raise RuntimeError("No properties")
+
+        self._properties = {}
+        self._num = 0
+
+        for p in props:
+            self.add(p)
+
+    def is_single(self):
+        """
+        Is the set singleton, i.e., only one property?
+        """
+        return self._num == 1
+
+    def get_single(self):
+        assert self.is_single()
+        return next((x for x in self._properties.values()))[0]
+
+    def add(self, p):
+        """
+        Add a new property to this set
+        """
+        self._properties.setdefault(p.key(), []).append(p)
+        self._num += 1
+
+    def has_unreach(self):
+        return self._properties.get(PRP_UNREACH_KEY) is not None
+
+    def has_termination(self):
+        return self._properties.get(PRP_TERMINATION_KEY) is not None
+
+    def has_memcleanup(self):
+        return self._properties.get(PRP_VALID_MEMCLEANUP) is not None
+
+    def has_memsafety(self):
+        return (
+            self._properties.get(PRP_VALID_FREE_KEY) is not None
+            or self._properties.get(PRP_VALID_DEREF_KEY) is not None
+            or self._properties.get(PRP_NO_MEMLEAK_KEY) is not None
+        )
+
+    def has_def_behavior(self):
+        return self._properties.get(PRP_DEF_BEHAVIOR_KEY) is not None
+
+    def has_no_overflow(self):
+        return self._properties.get(PRP_NO_SIGNED_OVERFLOW_KEY) is not None
+
+    def __iter__(self):
+        return (p for vals in self._properties.values() for p in vals)
+-e 
+
+========================================
+FILE: ./task/aggregatetask.py
+========================================
+from bbk.dbg import wdbg
+from .task import Task
+from .result import TaskResult
+
+class AggregateTask(Task):
+    """
+    This task spawns one or more subtasks and aggregates results from them.
+    It takes their results as they come and decides whether to
+    finish or continue the tasks and what to return.
+    If the result is REPLACE_TASK, it is done so by the workflow automatically,
+    so AggregateTask is something like an envelope for multiple tasks that can
+    evolve inside.
+
+    If this task has a timeout and it is passed, the subtasks
+    are stopped too.
+    TODO: we could do this configurable
+    """
+
+    def __init__(
+        self, tasks: list, aggregate=None, timeout=None, name=None, descr=None
+    ):
+        super().__init__(timeout=timeout, name=name, descr=descr)
+        if aggregate:
+            self.aggregate = aggregate
+
+        self._initial_tasks = tasks
+        self._subtasks = []
+        self._aggregated_result = None
+
+    def execute(self):
+        assert self._workflow is not None
+        for task in self._initial_tasks:
+            self.add_subtask(task)
+
+    def add_subtask(self, task):
+        assert (
+            self._aggregated_result is None
+        ), f"Adding a subtask {task} to already determined task {self} which already has result: {self._aggregated_result}"
+        wdbg().msg(f"{self}.add_subtask({task})", color="blue")
+        assert self._workflow is not None
+
+        self._subtasks.append(task)
+        task.set_parent(self)
+        task.add_event_listener("finish", self, self._subtask_finished)
+        self._workflow.add_task(task)
+
+    def _subtask_finished(self, event: str, task, result):
+        assert event == "finish", event
+        assert isinstance(task, Task), (task, type(task))
+        assert isinstance(result, TaskResult), (result, type(result))
+        wdbg().msg(f"{self}.subtask_finished({task}, {result})", color="blue")
+
+        self._subtasks.remove(task)
+
+        result = self.subtask_finished(task, result)
+        self.emit_event("subtask-finished", task, result)
+
+        # We already have the result, therefore the current call of this method
+        # is for the stopped tools, and we want to do nothing,
+        # or the result is that the task should be rewritten and therefor
+        # we are not done yet (and we will not call aggregate() on this result)
+        if self._aggregated_result or result.is_continuation():
+            return
+
+        result = self.aggregate(task, result)
+        # stop all subtasks if we have a final result
+        if result is not None:
+            assert isinstance(result, TaskResult), (result, type(result))
+            # store into result that `task` is the one that finished
+            result.subtask = task
+            self._aggregated_result = result
+            # stop other subtasks
+            self.stop()
+
+    def replace_subtask(self, subtask, new_task):
+        # the task has been already removed,
+        # so just add a new subtask
+        assert subtask not in self._subtasks
+        assert subtask.parent() is self
+        self.add_subtask(new_task)
+
+    def subtask_finished(self, task, result):
+        """
+        Child classes can override this method to get notified when a subtask finished
+        and to override the result. Whatever this method does, the task is going to be
+        removed from the subtasks as it has finished.
+
+        Alternatively one can get notified the standard way by adding an event listener
+        to 'subtask-finished(task, result)' event.
+        """
+        return result
+
+    def finish(self):
+        assert self.is_done()
+        if self._aggregated_result is None:
+            raise RuntimeError(
+                f"Aggregation returned None, override this method for class {self} to handle this case"
+            )
+        return self._aggregated_result
+
+    def is_aggregate(self):
+        return True
+
+    def aggregate(self, task, result):
+        """
+        This method is called whenever a sub-task `task` is finished, and it returns the `result`
+        which is other than REPLACE_TASK (in that case the task is replaced and this function
+        is not called).
+
+        If this method returns None, nothing happens and the Aggregate task continues.
+        If it returns result other than None, it is taken as the final result of the
+        Aggregate task.
+        The method can also return None all the time, in which case the Aggregation task
+        finishes after all subtasks are finished and it is up to the `finish` method to return
+        something sensible.
+        """
+        raise RuntimeError("This method must be overridden or given in __init__")
+
+    def is_running(self):
+        return self._aggregated_result is None and self._start_time is not None
+    
+    def result(self):
+        return self._aggregated_result
+
+    def stop(self):
+        for task in self._subtasks:
+            task.stop()
+
+    def kill(self):
+        for task in self._subtasks:
+            task.kill()
+
+    def is_done(self):
+        # Note that this check could fail in concurrent setup (if we ever
+        # do that) as adding a subtask to `self._subtasks` and setting the start time
+        # in the wrapper of `execute` is not atomic.
+        # But for now, we're fine.
+        return not self._subtasks and self._start_time is not None
+-e 
+
+========================================
+FILE: ./task/continuationtask.py
+========================================
+from . import AggregateTask
+from .result import TaskResult
+from .task import Task
+
+def wrap_continuation(other):
+    assert callable(other) or isinstance(other, (Task, TaskResult)), other
+    if callable(other):
+         
+        def new_continuation(result):
+            res = other(result)
+            if isinstance(res, Task):
+                return TaskResult("REPLACE_TASK", res)
+            if not isinstance(res, TaskResult):
+                return TaskResult("DONE", result)
+            return res
+
+    elif isinstance(other, TaskResult):
+
+        def new_continuation(result):
+            return other if result.is_done() else result
+    
+    else:
+
+        def new_continuation(result):
+            return TaskResult("REPLACE_TASK", other) if result.is_done() else result
+
+    return new_continuation
+        
+
+class ContinuationTask(Task):
+    """
+    Run a single task that is taken as an argument and
+    process its result. This is handy when we do not want
+    to inherit from that task (e.g., when the task is determined
+    during runtime).
+
+    """
+
+    def __init__(self, task, continuation=None, timeout=None, name=None, descr=None):
+        super().__init__(timeout=timeout, name=name, descr=descr)
+        assert task
+        self._task = task 
+        self._task_result = None
+
+        # overwrite the continuation method if given on commandline
+        if continuation is not None:
+            self.continuation = wrap_continuation(continuation)
+
+        task.add_event_listener("finish", self, self._task_finished)
+
+    def task(self):
+        return self._task
+
+    def continuation(self, result):
+        """
+        Override this method to take action after
+        the task finishes. This is an alternative
+        to passing a function as `continuation` parameter
+        in the __init__ method.
+        """
+        raise RuntimeError("Must be overriden or given as a parameter")
+
+    def execute(self):
+        self._task.set_parent(self)
+        self._workflow.add_task(self._task)
+
+    def replace_subtask(self, task, new_task):
+        # I am not so a big fan of this since I believe 
+        #    that the workflow should handle this.
+        # However, then the workflow has to handle listeners which is also not right.
+        # This seems to work for now.
+
+        assert task is self._task, (task, self._task)
+        assert task.parent() is self
+
+        self._task        = new_task
+        new_task.add_event_listener("finish", self, self._task_finished)
+        self.execute()
+
+    def _task_finished(self, event, task, result):
+        assert event == "finish", event
+        assert task is self._task, (task, self._task)
+        assert self._task_result is None, f"Already got a result: {self._task_result}"
+        if result and result.is_replace_task(): return # The task is not really finished
+        self._task_result = result
+    
+    def finish(self):
+        """
+        Run `continuation` and overwrite the result with the result
+        from the continuation.
+        """
+        # do not proceed if the task was stopped
+        if self.was_stopped():
+            return TaskResult("ERROR", descr="Continuation task has been stopped")
+
+        assert isinstance(self._task_result, TaskResult)
+        result = self.continuation(self._task_result)
+
+        self._task = None
+        return result
+
+    def is_running(self):
+        return self._start_time is not None and self._task_result is None
+
+    def stop(self):
+        if self._task:
+            self._task.stop()
+
+    def kill(self):
+        # this is partially because of debugging
+        assert self.was_stopped(), "Task must be stopped before trying to kill it"
+        if self._task:
+            self._task.kill()
+
+    def is_done(self):
+        return self._task_result is not None
+-e 
+
+========================================
+FILE: ./task/processtask.py
+========================================
+from signal import SIGINT, SIGKILL
+from subprocess import TimeoutExpired
+
+from .task import Task
+from .result import TaskResult
+
+from bbk.dbg import dbg, print_stdout
+from bbk.env import get_env
+from bbk.utils import _popen
+
+
+class ProcessResult:
+    def __init__(self, retval, sigval=None):
+        self.retval = retval
+        self.signal = sigval
+
+
+class ProcessTask(Task):
+    def __init__(self, cmd=None, timeout=None, name=None, envir=None, cwd=None):
+        super().__init__(timeout=timeout, name=name)
+        self._env = get_env()
+        self._proc = None
+        # Here we store the `ProcessResult` in the default
+        # implementation of `finish` method.
+        self._retval = None
+        # environment variables
+        self._environ = envir
+        self._cwd = cwd
+        self._cmd = cmd
+
+        # while reading the output of the tool, we might not read whole lines
+        # every time. Keep the partial output here. The key is either "stdout"
+        # or "stderr"
+        self._partial_output = {}
+
+    def env(self):
+        return self._env
+
+    def name(self):
+        return self._name or str(self)
+
+    def cmd(self):
+        """
+        The user can adjust what process is executed by setting self._cmd or by overwriting this method.
+
+        Returns: A list that can be passed to Popen.
+        """
+        return self._cmd
+
+    def set_cmd(self, cmd):
+        self._cmd = cmd
+
+    def is_done(self):
+        return self._retval is not None
+
+    def proc(self):
+        return self._proc
+
+    def retval(self):
+        return self._retval
+
+    def fds(self):
+        """Get stdout and stderr (in this order) filedescriptors"""
+        assert self.proc(), "Process is not running"
+        return self.proc().stdout.fileno(), self.proc().stderr.fileno()
+
+    def cleanup(self):
+        pass
+
+    def execute(self):
+        cmd = self.cmd()
+        assert isinstance(cmd, list), cmd
+        assert all(
+            (isinstance(x, str) for x in cmd)
+        ), f"cmd is not a list of strings: {cmd}"
+
+        print_stdout(
+            f"## Run {self.name()} [time: {self.start_time() - self.env().start_time}] with timeout {self.timeout()}",
+            color="cyan",
+        )
+        print_stdout("#", " ".join(cmd))
+        self._popen(cmd, self._environ, self._cwd)
+
+    def finish(self):
+        """
+        The default implementation of `finish` method.
+        """
+        dbg(f"## End {self.name()}", color="cyan")
+
+        if self._proc is None:
+            return TaskResult("ERROR", descr="Process failed starting")
+
+        retval = self._proc.wait()
+        self._retval = ProcessResult(retval)
+        self._proc = None
+        if retval == 0:
+            return TaskResult("DONE")
+        return TaskResult("ERROR")
+
+    def _popen(self, cmd, env, cwd=None):
+        self._proc = _popen(cmd, env=env, cwd=cwd)
+
+    def stop(self):
+        if self._proc:
+            self._proc.send_signal(SIGINT)
+
+    def kill(self):
+        if self._proc:
+            self._proc.terminate()
+            self._proc.kill()
+            # sometimes proc.kill() does not work :-/
+            self._proc.send_signal(SIGKILL)
+
+    def wait_for_finish(self, timeout=None):
+        """
+        Wait until the task finishes -- this blocks!
+
+        This method can be used to synchronously wait until the task finishes.
+        It should be used only in exceptional situations, with care, and ideally with a timeout.
+        In the best case, you do not need to use this method. Where it make sense is, for example,
+        when a task is stopped and it make take a few more miliseconds to actually finish
+        and dump some files, then wait for the files.
+
+        Params:
+          timeout: None or float, timeout in miliseconds
+        """
+        if self._proc is None:
+            return True
+
+        if self._proc.poll() is not None:
+            return True
+
+        try:
+            self._proc.wait(timeout)
+            return True
+        except TimeoutExpired:
+            return False
+
+    def is_running(self):
+        return self._proc is not None
+
+    def is_program(self):
+        """
+        Returns:
+
+        True if this task is running a subprocess.
+        (We need to know so that we can monitor its stdout and stderr).
+        """
+        return True
+-e 
+
+========================================
+FILE: ./task/result.py
+========================================
+class TaskResult:
+    """
+    The result of executing a Task.
+    """
+
+    # These are reserved results
+    RESULTS = [
+        # spawn new tasks in the current workflow,
+        # they are independent of any other task
+        # (unless some relations are explicitely set)
+        "NEW_TASKS",
+        # Replace the currently ending task with a new task.
+        # Any listener of the finishing task is re-connected
+        # to the new task, so it is assumed that the new
+        # task "finishes" the job of the old task
+        # and returns results in the same format
+        "REPLACE_TASK",
+        # task is done and there were no problems
+        # in _executing_ the task (the result of the task still
+        # may represent an error found in a program)
+        "DONE",
+        # an error was met during executing the task
+        # (e.g., the process failed starting or executing)
+        "ERROR",
+        # the task timeout-ed
+        "TIMEOUT",
+        # the task has been stopped
+        "STOPPED",
+    ]
+
+    def __init__(self, status, output=None, descr=None, task=None):
+        self.status = status
+        self.output = output
+        self.description = descr
+        # if the task is an aggregate task, we want to know what subtask
+        # gave the result and it is stored here
+        self.task = task
+
+    def is_done(self):
+        return self.status.startswith("DONE")
+
+    def is_error(self):
+        return self.status.startswith("ERROR")
+
+    def is_timeout(self):
+        return self.status.startswith("TIMEOUT")
+
+    def is_stopped(self):
+        return self.status == "STOPPED"
+
+    def is_new_tasks(self):
+        return self.status == "NEW_TASKS"
+
+    def is_replace_task(self):
+        return self.status == "REPLACE_TASK"
+
+    def is_continuation(self):
+        """Return true if this result asks for running another tasks"""
+        return self.is_new_tasks() or self.is_replace_task()
+
+    def __repr__(self):
+        return f"TaskResult({self.status}, descr={self.description}, output={self.output}, task={self.task})"
+-e 
+
+========================================
+FILE: ./task/task.py
+========================================
+from time import clock_gettime, CLOCK_REALTIME
+
+from bbk.dbg import wdbg
+from bbk.task.result import TaskResult
+
+
+def finish_wrapper(task, finish_method):
+    def new_finish():
+        wdbg().msg(f"Finishing task {task} ({task.descr()})")
+
+        task._finish_time = clock_gettime(CLOCK_REALTIME)
+        result = finish_method()
+        task._result = result
+
+        task.emit_event("finish", task, result)
+
+        return result
+
+    return new_finish
+
+
+def wrap_methods(task):
+    """
+    Wrap methods of a Task instance.
+
+    We want to track things like start and stop time (and those are
+    important, we need to track them due to timeouts and so on.).
+    But to keep it simple, we want the user just to define `execute`,
+    and `finish`, etc. without explicitly doing this logging.
+    So we wrap the methods with another code during Task's
+    initialization.
+    """
+    task_stop = task.stop
+    task_exec = task.execute
+
+    def new_stop():
+        task.set_stopped_time(clock_gettime(CLOCK_REALTIME))
+        task.emit_event("stop")
+        return task_stop()
+
+    def new_execute():
+        # do not proceed if the task was stopped in between queeing and starting
+        if task.was_stopped():
+            wdbg().msg(f"NOT Starting STOPPED task {task} ({task.descr()})")
+            return
+
+        wdbg().msg(f"Starting task {task} ({task.descr()})")
+        task._start_time = clock_gettime(CLOCK_REALTIME)
+        task_exec()
+
+        task.emit_event("execute", task)
+
+    task.stop = new_stop
+    task.execute = new_execute
+    task.finish = finish_wrapper(task, task.finish)
+
+
+class Task:
+    """
+    Base class for tasks of a workflow.
+
+    Every task is assigned to exactly one aggregator task
+    that waits for its results and processes them.
+    """
+
+    def __init__(self, timeout=None, name=None, descr=None):
+        self._name = name
+        self._description = descr
+        self._workflow = None
+        self._start_time = None
+        self._finish_time = None
+        self._timeout = timeout
+        # Stopping a time can take some time (if that is a process).
+        # We remember when we tried to stop it and if it is not stopped
+        # after some time, we kill it.
+        self._stopped_time = None
+        # here we store the result of the task so that it is accessible
+        # even later after the call to `finish()`
+        self._result = None
+        # This flag is set to true when the task is being tearing down
+        self._tearing_down = False
+
+        # listening tasks that wait for the notification
+        # about events that occur while executing the tasks.
+        # We always support 'execute' and 'finish' events.
+        self._events_callbacks = {}
+        # the revers relation to _events_callbacks
+        self._listens_to = {}
+        # some tasks may be in parent-child relationship.
+        # If a task is a child of some other task, its result
+        # is not considered to be a result of the Workflow it runs
+        # in. Final results are yield only by tasks without parents.
+        self._parent = None
+        self._unwrapped_finish = self.finish
+        # self._original_finish = self.finish
+
+        wrap_methods(self)
+
+    def execute(self):
+        """
+        Execute this task. The result of executing this task must be stored in the object
+        and returned by the `finish` method. It can be also later accessible by the `result` method.
+
+        To store the result, there's the attribute _result that is returned by the default
+        implementation of the method `result`. It is up to the implementation if it stores
+        the result into `_result` or if it overrides the `result` method.
+        """
+        raise NotImplementedError(f"Must be overriden by the class: {type(self)}")
+
+    def finish(self):
+        """
+        This method is called when the task finishes.
+        """
+        raise NotImplementedError(f"Must be overriden by the class: {type(self)}")
+
+    def events_callbacks(self) -> dict:
+        return self._events_callbacks
+
+    def listens_to(self) -> dict:
+        return self._listens_to
+
+    def add_event_listener(self, event: str, task, callback) -> None:
+        """
+        Add listener to this task for event `event`. Whenever the event
+        is triggered, `callback` is called (with parameters specific
+        for that event).
+
+        \param event:    string describing the event
+        \param task:     the task that listens to the event
+        \param callback: the callback to call when event is triggered
+        """
+        assert isinstance(event, str), (event, type(event))
+        assert isinstance(task, Task), (task, type(task))
+
+        wdbg().listens_to(task, self)
+        self._events_callbacks.setdefault(event, []).append(callback)
+        task._listens_to.setdefault(event, []).append(self)
+        self._reports_to_workflow = False
+
+    def emit_event(self, event: str, *args, **kwargs):
+        """
+        Emit callbacks for a given event
+        """
+        for cb in self.events_callbacks().get(event) or ():
+            cb(event, *args, **kwargs)
+
+    def set_parent(self, task):
+        assert self._parent is None, "Already have a parent"
+        self._parent = task
+
+    def parent(self) -> "Task":
+        return self._parent
+
+    def is_program(self):
+        """
+        Return True if this task is running a program.
+        (We need to know so that we can monitor its stdout and stderr).
+        """
+        return False
+
+    def is_done(self):
+        """
+        Determine if the task is done.
+
+        This method should be overriden by the child class.
+
+        Returns:
+          True if the task is done else False.
+        """
+        return False
+
+    def is_running(self):
+        """
+        Determine if the task is running (it has been started and is not done yet).
+
+        This method can be overriden by the child class if the default implementation
+        is not enough.
+
+        Returns:
+          True if the task is running else False.
+        """
+        return self.start_time() is not None and not self.is_done()
+
+    def result(self):
+        """
+        Cached result of the task.
+
+        Once the task is done, the method `finish_task()` is called by the workflow.
+        This method calls `task.finish()` which returns a result that we
+        remember in `self._result` and it can be later obtained via a call to this method.
+        """
+        return self._result
+
+    def stop(self):
+        """
+        Stop the task.
+
+        Must be overriden by child classes to implement stopping
+        a running task. Stopping the running task must result
+        in `is_done` method returning True in a short amount
+        of time.
+        """
+        raise NotImplementedError("Must be overridden")
+
+    def kill(self):
+        """
+        Kill the task.
+
+        Must be overriden by child classes to implement killing
+        a running task. Killing a task must cause an action
+        that makes `is_done` _immediately_ return True if called.
+        """
+        raise NotImplementedError(f"Must be overridden for class {type(self)}")
+
+    def cleanup(self):
+        """
+        Cleanup after the task.
+
+        This method is called by the workflow after stopping or killing the task.
+        """
+        pass
+
+    def name(self):
+        return self._name
+
+    def is_aggregate(self):
+        return False
+
+    def start_time(self):
+        return self._start_time
+
+    def finish_time(self):
+        return self._finish_time
+
+    def stopped_time(self):
+        return self._stopped_time
+
+    def was_stopped(self):
+        return self._stopped_time is not None
+
+    def set_stopped_time(self, tm):
+        self._stopped_time = tm
+
+    def set_workflow(self, wf):
+        self._workflow = wf
+
+    def workflow(self):
+        return self._workflow
+
+    def set_timeout(self, timeout):
+        self._timeout = timeout
+
+    def timeout(self):
+        return self._timeout
+
+    def set_descr(self, msg):
+        self._description = msg
+
+    def descr(self):
+        return self._description
+
+    def __repr__(self):
+        d = self._description
+        if d:
+            return f"<{d} 0x{hex(id(self))}>"
+        return super().__repr__()
+-e 
+
+========================================
+FILE: ./task/__init__.py
+========================================
+from .task import Task
+from .aggregatetask import AggregateTask
+from .result import TaskResult
+from .continuationtask import ContinuationTask
+
+# There is currently no nicer way (except for merging all tasks into one file)
+Task.__rshift__ = lambda self, other: ContinuationTask(self, continuation=other)-e 
+
+========================================
+FILE: ./timeout.py
+========================================
+from bbk.task import AggregateTask
+
+
+class TimeoutWatchdog(AggregateTask):
+    """
+    Run a given task with a (global) timeout.
+    If the task rewrites itself, the timeout will not reset.
+    """
+
+    def __init__(self, task, timeout):
+        super().__init__([task], aggregate=lambda t, r: r, timeout=timeout)
+-e 
+
+========================================
+FILE: ./tool.py
+========================================
+from bbk.task.processtask import ProcessTask
+
+
+class Tool(ProcessTask):
+    def __init__(self, exe, inputs, args=None, name=None, envir=None, timeout=None):
+        super().__init__(timeout=timeout, name=name, envir=envir)
+        self._exe = exe
+        self._args = args or []
+        self._inputs = inputs
+        self._add_options = None
+
+    def exe(self):
+        return self._exe
+
+    def args(self):
+        return self._args
+
+    def resultsdir(self):
+        return None
+
+    def add_options(self, opts):
+        self._add_options = opts
+
+    def cmd(self):
+        return [self._exe] + self._args + (self._add_options or []) + self._inputs
+
+    def cleanup(self):
+        """Override for running some cleanup after running the tool."""
+        pass
+-e 
+
+========================================
+FILE: ./tools/cbmc.py
+========================================
+import re
+
+from bbk.env import get_env
+from bbk.verdict import Verdict
+from bbk.tool import Tool
+from bbk.tools.tooloutputparser import ToolOutputParser
+from bbk.task.result import TaskResult
+from bbk.dbg import dbg, dbgv
+from bbk.witness import WitnessGraphML, WitnessHarness
+from bbk.properties import PropertiesSet
+from os.path import exists, splitext
+
+from bbk.utils import find_program
+
+from svcomp.helpers import SVCompProperty
+
+
+def line_contains(line, *args):
+    return any((a in line for a in args))
+
+
+class CbmcParser(ToolOutputParser):
+    def __init__(self, tool, properties, resultsdir):
+        super().__init__(f"{resultsdir}/stdout.txt", f"{resultsdir}/stderr.txt")
+        self._tool = tool
+        self._properties = properties
+        self._ignore_lines = []
+        self._errors = []
+        self_found_error = False
+        self._killed_paths = []
+        self._warnings = []
+        self._retval = None
+        self._resultsdir = resultsdir
+
+        self._assert_re = re.compile(".*assertion .*: FAILURE")
+
+    def get_prp(self, key):
+        for p in self._properties:
+            if p.key() == key:
+                return p
+        return None
+
+    def add_error_or_killed(self, prpkey, line, errortype=None):
+        prp = self.get_prp(prpkey)
+        if prp:
+            # Wait until KLEE finishes and dumps all the files
+            # Use a (generous) timeout, if KLEE does not finish until then,
+            # just continue. Generating the witness will probably fail in
+            # that case.
+            if not self._tool.wait_for_finish(5000):
+                line += " (XXX: waiting for CBMC finishing failed)"
+            self._errors.append(
+                Verdict(
+                    Verdict.INCORRECT,
+                    prp,
+                    info=line,
+                    witness=None,
+                )
+            )
+        else:
+            dbg("CBMC found a different error")
+            self._killed_paths.append(Verdict(Verdict.UNKNOWN, None, line))
+
+    def add_ignore_stderr_lines(self, string):
+        self._ignore_lines.append(string)
+
+    def parse_stdout_ev(self, ev, line):
+        assert ev == "line-stdout"
+        self._parse_stdout(line.decode("utf-8"))
+
+    def _parse_stdout(self, line):
+        if line_contains(line, *self._ignore_lines):
+            return
+
+        if self._assert_re.match(line):
+            self.add_error_or_killed("unreach", line)
+
+    def killed_paths(self):
+        return self._killed_paths
+
+    def warnings(self):
+        return self._warnings
+
+    def finish(self, retcode):
+        self._retval = retcode
+
+    def result(self):
+        if self._errors:
+            return self._errors
+        if self._retval is None:
+            return None
+        if self._killed_paths:
+            return self._killed_paths
+        if self._retval == 0:
+            # if self._killed_paths:
+            #    return [Verdict(Verdict.UNKNOWN, kp) for kp in self._killed_paths]
+            # assert self._no_error_found
+            return [Verdict(Verdict.CORRECT, prp, "") for prp in self._properties]
+        return [Verdict(Verdict.ERROR, None, f"retval: {self._retval}")]
+
+
+class Cbmc(Tool):
+    instance_counter = 0
+
+    def __init__(self, programs, properties, args=None, name="cbmc", timeout=None):
+        self._resultsdir = f"{get_env().workdir}/cbmc-{Cbmc.instance_counter}"
+        Cbmc.instance_counter += 1
+
+        properties = PropertiesSet(*properties)
+
+        the_args = args.copy()
+
+        if not any((lambda a: "--unwind" in a or "--depth" in a for a in the_args)):
+            raise RuntimeError("CBMC needs --unwind or --depth argument specified")
+
+        cbmc_exe = find_program("cbmc", [f"{get_env().srcdir}/cbmc/bin/"])
+        dbgv(f"Using CBMC: {cbmc_exe}")
+        super().__init__(
+            cbmc_exe,
+            inputs=[cu.path for cu in programs],
+            args=the_args,
+            name=name,
+            timeout=timeout,
+        )
+
+        self._parser = CbmcParser(self, properties, self.resultsdir())
+        self.add_event_listener("line-stdout", self, self._parser.parse_stdout_ev)
+
+    def parser(self):
+        return self._parser
+
+    def add_ignore_stderr_lines(self, string):
+        """
+        During parsing stderr, ignore lines containing the given substring.
+        This can be used to ignore selected found error etc.
+        """
+        self._parser.add_ignore_stderr_lines(string)
+
+    def resultsdir(self):
+        return self._resultsdir
+
+    def finish(self):
+        super().finish()  # get the retval
+
+        self._parser.finish(self.retval().retval)
+        return TaskResult("DONE", self._parser.result(), task=self)
+-e 
+
+========================================
+FILE: ./tools/cpachecker.py
+========================================
+import re
+
+from bbk.env import get_env
+from bbk.verdict import Verdict
+from bbk.tool import Tool
+from bbk.tools.tooloutputparser import ToolOutputParser
+from bbk.task.result import TaskResult
+from bbk.dbg import dbg, dbgv
+from bbk.witness import WitnessGraphML, WitnessHarness
+from bbk.properties import PropertiesSet
+from os.path import exists, splitext
+
+from bbk.utils import find_program
+
+from svcomp.helpers import SVCompProperty
+
+
+def line_contains(line, *args):
+    return any((a in line for a in args))
+
+
+class CPAcheckerParser(ToolOutputParser):
+    def __init__(self, tool, properties, resultsdir):
+        super().__init__(f"{resultsdir}/stdout.txt", f"{resultsdir}/stderr.txt")
+        self._tool = tool
+        self._properties = properties
+        self._ignore_lines = []
+        self._errors = []
+        self_found_error = False
+        self._killed_paths = []
+        self._warnings = []
+        self._retval = None
+        self._resultsdir = resultsdir
+        self._result = None
+
+        # self._assert_re = re.compile(".*assertion .*: FAILURE")
+
+    def get_prp(self, key):
+        for p in self._properties:
+            if p.key() == key:
+                return p
+        return None
+
+    def add_error_or_killed(self, prpkey, line, errortype=None):
+        prp = self.get_prp(prpkey)
+        if prp:
+            # Wait until KLEE finishes and dumps all the files
+            # Use a (generous) timeout, if KLEE does not finish until then,
+            # just continue. Generating the witness will probably fail in
+            # that case.
+            if not self._tool.wait_for_finish(5000):
+                line += " (XXX: waiting for cpachecker finishing failed)"
+            self._errors.append(
+                Verdict(
+                    Verdict.INCORRECT,
+                    prp,
+                    info=line,
+                    witness=None,
+                )
+            )
+        else:
+            dbg("cpachecker found a different error")
+            self._killed_paths.append(Verdict(Verdict.UNKNOWN, None, line))
+
+    def add_ignore_stderr_lines(self, string):
+        self._ignore_lines.append(string)
+
+    def parse_stdout_ev(self, ev, line):
+        assert ev == "line-stdout"
+        self._parse_stdout(line.decode("utf-8"))
+
+    def _parse_stdout(self, line):
+        if line_contains(line, *self._ignore_lines):
+            return
+
+        if "Verification result: FALSE" in line:
+            self._result = "FALSE"
+            if "Property violation (assertion" in line:
+                self.add_error_or_killed("unreach", line)
+            if "Property violation (error label" in line:
+                self.add_error_or_killed("unreach", line)
+            if "Property violation (unreach-call" in line:
+                self.add_error_or_killed("unreach", line)
+
+        if "Verification result: TRUE" in line:
+            assert not self._result
+            self._result = "TRUE"
+
+    def killed_paths(self):
+        return self._killed_paths
+
+    def warnings(self):
+        return self._warnings
+
+    def finish(self, retcode):
+        self._retval = retcode
+
+    def result(self):
+        if self._errors:
+            if self._result == "FALSE":
+                return self._errors
+            return [Verdict(Verdict.UNKNOWN, None, "Inconsistent results")]
+        if self._retval is None:
+            return None
+        if self._killed_paths:
+            return self._killed_paths
+        if self._retval == 0:
+            if self._killed_paths:
+                return [Verdict(Verdict.UNKNOWN, None, kp) for kp in self._killed_paths]
+            assert self._result != "FALSE"
+            if self._result == "TRUE":
+                return [Verdict(Verdict.CORRECT, prp, "") for prp in self._properties]
+            else:
+                return [Verdict(Verdict.UNKNOWN, None, "Inconsistent results")]
+        return [Verdict(Verdict.ERROR, None, f"retval: {self._retval}")]
+
+
+class CPAchecker(Tool):
+    instance_counter = 0
+
+    def __init__(
+        self, programs, properties, args=None, name="cpachecker", timeout=None
+    ):
+        self._resultsdir = (
+            f"{get_env().workdir}/cpachecker-{CPAchecker.instance_counter}"
+        )
+        CPAchecker.instance_counter += 1
+
+        properties = PropertiesSet(*properties)
+
+        args = args or []
+        for prp in properties:
+            try:
+                prpfile = prp.prpfile()
+                if prpfile[0] != "/":
+                    prpfile = f"{get_env().cwd}/{prpfile}"
+                args += ["-spec", prpfile]
+            except AttributeError:
+                continue
+
+        the_args = ["-preprocess", "-heap", "10000M", "-benchmark"] + args
+
+        cpachecker_exe = find_program(
+            "cpa.sh", [f"{get_env().srcdir}/cpachecker/scripts/"]
+        )
+        dbgv(f"Using cpachecker: {cpachecker_exe}")
+        super().__init__(
+            cpachecker_exe,
+            inputs=[cu.path for cu in programs],
+            args=the_args,
+            name=name,
+            timeout=timeout,
+        )
+
+        self._parser = CPAcheckerParser(self, properties, self.resultsdir())
+        self.add_event_listener("line-stdout", self, self._parser.parse_stdout_ev)
+
+    def parser(self):
+        return self._parser
+
+    def add_ignore_stderr_lines(self, string):
+        """
+        During parsing stderr, ignore lines containing the given substring.
+        This can be used to ignore selected found error etc.
+        """
+        self._parser.add_ignore_stderr_lines(string)
+
+    def resultsdir(self):
+        return self._resultsdir
+
+    def finish(self):
+        super().finish()  # get the retval
+
+        self._parser.finish(self.retval().retval)
+        return TaskResult("DONE", self._parser.result(), task=self)
+-e 
+
+========================================
+FILE: ./tools/klee.py
+========================================
+from bbk.env import get_env
+from bbk.verdict import Verdict
+from bbk.tool import Tool
+from bbk.tools.tooloutputparser import ToolOutputParser
+from bbk.task.result import TaskResult
+from bbk.dbg import dbg, dbgv
+from bbk.witness import WitnessGraphML, WitnessHarness
+from os import environ, listdir
+from os.path import exists, splitext
+
+from svcomp.helpers import SVCompProperty
+
+
+def line_contains(line, *args):
+    return any((a in line for a in args))
+
+
+def err_file_matches_line(path, file, lineno):
+    lineno_ok, file_ok = False, False
+
+    with open(path, "r") as fobj:
+        for line in fobj:
+            if "File:" in line and line.rstrip().endswith(file):
+                file_ok = True
+            if "Line:" in line and line.rstrip().endswith(lineno):
+                lineno_ok = True
+
+            if file_ok and lineno_ok:
+                return True
+    return False
+
+
+def err_file_matches(file, line_file, line_line, errortype):
+    if line_file is None:
+        if errortype is None or errortype in file:
+            if errortype is None:
+                dbgv("No dbg info nor error type, taking the first witness")
+            else:
+                dbgv(f"Taking the first witness of the given type: {errortype}")
+            return True
+    elif err_file_matches_line(file, line_file, line_line):
+        return True
+
+    return False
+
+
+def get_witness(resultsdir, line, errortype):
+    """
+    Get witness object referencing the right GraphML file
+    that corresponds to the found error (based on the error message)
+    """
+    # KLEE: ERROR: splits/t-l.c:11:
+    if "location information missing" in line:
+        line_file, line_line = None, None
+    else:
+        tmp = line.split()[2].split(":")
+        line_file, line_line = tmp[0], tmp[1]
+        assert int(line_line) > 0  # "check" also the format
+
+    witnesses = []
+
+    for file in listdir(resultsdir):
+        if file.endswith(".err"):
+            dotidx = file.find(".")
+            assert dotidx > 0, file
+            namebase = file[:dotidx]
+            if err_file_matches(
+                f"{resultsdir}/{file}", line_file, line_line, errortype
+            ):
+                path = f"{resultsdir}/{namebase}.graphml"
+                if exists(path):
+                    witnesses.append(WitnessGraphML(path=path))
+                path = f"{resultsdir}/{namebase}.harness.c"
+                if exists(path):
+                    witnesses.append(WitnessHarness(path=path))
+
+    return witnesses or None
+
+
+class KleeParser(ToolOutputParser):
+    def __init__(self, tool, properties, resultsdir):
+        super().__init__(f"{resultsdir}/stdout.txt", f"{resultsdir}/stderr.txt")
+        self._tool = tool
+        self._properties = properties
+        self._ignore_lines = []
+        self._errors = []
+        self._killed_paths = []
+        self._warnings = []
+        self._retval = None
+        self._memsafety = any(
+            (
+                prp.is_valid_deref() or prp.is_valid_free() or prp.is_no_memleak()
+                for prp in properties
+            )
+        )
+        self._only_termination = (
+            len(properties) == 1 and next(iter(properties)).is_termination()
+        )
+        self._only_memcleanup = (
+            len(properties) == 1 and next(iter(properties)).is_memcleanup()
+        )
+
+        self._resultsdir = resultsdir
+
+    def get_prp(self, key):
+        for p in self._properties:
+            if p.key() == key:
+                return p
+        return None
+
+    def add_error_or_killed(self, prpkey, line, errortype=None):
+        prp = self.get_prp(prpkey)
+        if prp:
+            dbg("KLEE found an error")
+            # Wait until KLEE finishes and dumps all the files
+            # Use a (generous) timeout, if KLEE does not finish until then,
+            # just continue. Generating the witness will probably fail in
+            # that case.
+            if not self._tool.wait_for_finish(100):
+                line += " (XXX: waiting for KLEE finishing failed)"
+            self._errors.append(
+                Verdict(
+                    Verdict.INCORRECT,
+                    prp,
+                    info=line,
+                    witness=get_witness(self._resultsdir, line, errortype),
+                )
+            )
+        else:
+            dbg("KLEE found a different error")
+            self._killed_paths.append(Verdict(Verdict.UNKNOWN, None, line))
+
+    def add_ignore_stderr_lines(self, string):
+        self._ignore_lines.append(string)
+
+    def parse_stderr_ev(self, ev, line):
+        assert ev == "line-stderr"
+        self._parse_stderr(line.decode("utf-8"))
+
+    def _parse_stderr(self, line):
+        if line_contains(line, *self._ignore_lines):
+            return
+
+        if "ASSERTION FAIL:" in line:
+            if self._only_termination or self._only_memcleanup:
+                # ignore ASSERTION errors as those just terminate a path
+                return
+            self.add_error_or_killed("unreach", line, "assert")
+            # else we're not looking for unreach call
+        elif line_contains(
+            line,
+            "silently concretizing (reason: floating point)",
+            "Call to pthread_create",
+            "unsupported pthread API.",
+            "failed external call: ",
+            ": divide by zero",
+            "KLEE: WARNING: Maximum stack size reached.",
+            "WARNING ONCE: skipping fork (memory cap exceeded)",
+            "return void when caller expected a result",
+            "Query timed out (fork)",
+            "KLEE: ctrl-c detected, requesting interpreter to halt",
+        ) or ("WARNING: killing" in line and "over memory cap: " in line):
+            self._killed_paths.append(Verdict(Verdict.UNKNOWN, None, line))
+        elif "memory error:" in line:
+            if self._memsafety:
+                if "memory error: memory leak detected" in line:
+                    self.add_error_or_killed("no-memleak", line, "leak")
+                elif line_contains(
+                    line,
+                    "memory error: out of bound pointer",
+                    "memory error: object read only",
+                    "memory error: calling nullptr",
+                ):
+                    self.add_error_or_killed("valid-deref", line, "ptr")
+                elif line_contains(
+                    line,
+                    "memory error: invalid pointer: free",
+                    "memory error: free of alloca",
+                    "memory error: free of global",
+                ):
+                    self.add_error_or_killed("valid-free", line, "free")
+                else:
+                    self._killed_paths.append(Verdict(Verdict.UNKNOWN, None, line))
+
+            elif "memory error: memory not cleaned up" in line:
+                self.add_error_or_killed("memcleanup", line, "leak")
+            else:
+                self._killed_paths.append(Verdict(Verdict.UNKNOWN, None, line))
+        elif "KLEE: ERROR:" in line and line_contains(
+            line,
+            "signed-integer-overflow",
+            "integer division overflow",
+            ": overshift error",
+            "shift out of bounds",
+        ):
+            self.add_error_or_killed("no-signed-overflow", line)
+        elif self._memsafety and line_contains(
+            line, "KLEE: WARNING: Failed resolving segment in memcleanup check"
+        ):
+            self._killed_paths.append(Verdict(Verdict.UNKNOWN, None, line))
+        # elif "KLEE: done: partially completed paths" in line:
+        #    if int(line.split()[6]) > 0:
+        #        self._killed_paths.append(Verdict(Verdict.UNKNOWN, None, line))
+        elif "KLEE: WARNING" in line:
+            self._warnings.append(line)
+
+    def killed_paths(self):
+        return self._killed_paths
+
+    def warnings(self):
+        return self._warnings
+
+    def finish(self, retcode):
+        self._retval = retcode
+
+    def result(self):
+        if self._errors:
+            return self._errors
+        if self._retval is None:
+            return None
+        if self._killed_paths:
+            return self._killed_paths
+        if self._retval == 0:
+            # if self._killed_paths:
+            #    return [Verdict(Verdict.UNKNOWN, kp) for kp in self._killed_paths]
+            # assert self._no_error_found
+            return [Verdict(Verdict.CORRECT, prp, "") for prp in self._properties]
+        return [Verdict(Verdict.ERROR, None, f"retval: {self._retval}")]
+
+
+class Klee(Tool):
+    instance_counter = 0
+
+    def __init__(self, bitcode, properties, args=None, name="klee", timeout=None):
+        self._resultsdir = f"{get_env().workdir}/lee-{Klee.instance_counter}"
+        Klee.instance_counter += 1
+
+        the_args = [
+            "-dump-states-on-halt=0",
+            "--output-stats=0",
+            "--use-call-paths=0",
+            # "--optimize=false",
+            "-silent-klee-assume=1",
+            "-istats-write-interval=60s",
+            "-timer-interval=10",
+            "-only-output-states-covering-new=1",
+            "-use-forked-solver=0",
+            "-external-calls=pure",
+            "-max-memory=8000",
+            "-output-source=false",
+            "-malloc-symbolic-contents",
+            f"-output-dir={self._resultsdir}",
+        ] + (args or [])
+
+        error_fns = []
+        for prp in properties:
+            if prp.is_unreach():
+                error_fns += prp.error_funs()
+        if error_fns:
+            the_args.extend(["-error-fn", ",".join(error_fns)])
+
+        new_env = environ.copy()
+        new_env[
+            "LD_LIBRARY_PATH"
+        ] = f"{get_env().srcdir}/klee/build/lib/:{environ['LD_LIBRARY_PATH']}"
+        klee_runtime_dir = f"{get_env().srcdir}/klee/build/lib/klee/runtime"
+        if exists(klee_runtime_dir):
+            # If this dir exists, we're out of build and we must tell KLEE
+            # that there it finds its libraries.
+            # Otherwise KLEE will get them from the build automatically
+            # and we do not need to set anything.
+            new_env["KLEE_RUNTIME_LIBRARY_PATH"] = klee_runtime_dir
+
+        super().__init__(
+            f"{get_env().srcdir}/klee/build/bin/klee",
+            inputs=[bitcode],
+            args=the_args,
+            name=name,
+            envir=new_env,
+            timeout=timeout,
+        )
+
+        self._parser = KleeParser(self, properties, self.resultsdir())
+        self.add_event_listener("line-stderr", self, self._parser.parse_stderr_ev)
+
+    def parser(self):
+        return self._parser
+
+    def add_ignore_stderr_lines(self, string):
+        """
+        During parsing stderr of KLEE, ignore lines containing the given substring.
+        This can be used to ignore selected found error etc.
+        """
+        self._parser.add_ignore_stderr_lines(string)
+
+    def stop(self):
+        super().stop()
+
+    def resultsdir(self):
+        return self._resultsdir
+
+    def finish(self):
+        super().finish()  # get the retval
+
+        self._parser.finish(self.retval().retval)
+        return TaskResult("DONE", self._parser.result(), task=self)
+
+
+def get_klee_args(args, properties):
+    options = []
+    options.extend(args.X)
+
+    if args.sv_comp:
+        options.append("-write-witness")
+
+    # if args.timeout and args.timeout > 0:
+    #    options.append(f"-max-time={args.timeout}")
+    def add(p):
+        if p not in options:
+            options.append(p)
+
+    no_memleak = True
+    for prp in properties:
+        if prp.is_unreach():
+            add("-exit-on-error-type=Assert")
+        elif prp.is_memcleanup():
+            # NOTE: this elif must be before memleak, because that one matches too
+            add("-check-memcleanup")
+            add("-exit-on-error-type=Leak")
+        elif prp.is_no_memleak():
+            no_memleak = False
+            add("-check-leaks")
+            add("-exit-on-error-type=Leak")
+        elif prp.is_valid_deref():
+            add("-exit-on-error-type=Ptr")
+            add("-exit-on-error-type=ReadOnly")
+            add("-exit-on-error-type=BadVectorAccess")
+        elif prp.is_valid_free():
+            add("-exit-on-error-type=Free")
+        elif prp.is_no_signed_overflow():
+            add("-ubsan-runtime")
+            add("-exit-on-error-type=Overflow")
+            add("-exit-on-error-type=ReportError")
+        elif prp.is_termination():
+            pass
+        elif isinstance(prp, SVCompProperty) and prp.is_memcleanup():
+            add("-check-memcleanup")
+        else:
+            return None
+    if no_memleak:
+        # these leak memory, so do not use them if we look for leaks
+        # FIXME: do not add these if libc or POSIX are not used by the program
+        add("-libc=klee")
+        # FIXME: we do not use POSIX runtime since syscall is not modelled by KLEE
+        # and thus it is symbolic, which basically breaks the POSIX runtime of KLEE
+        # add("-libc=uclibc")
+        # add("-posix-runtime")
+    else:
+        add("-libc=klee")
+    if args.exec_witness or args.harness:
+        add("-write-harness")
+
+    # This makes KLEE exit without searching the path-space for some reason
+    # add("-write-ktests=0")
+
+    return options
+-e 
+
+========================================
+FILE: ./tools/slowbeast.py
+========================================
+# from tempfile import mkdtemp
+from os import environ, makedirs
+
+from bbk.env import get_env
+from bbk.tools.tooloutputparser import ToolOutputParser
+from bbk.task.result import TaskResult
+from bbk.tool import Tool
+from bbk.verdict import Verdict
+from bbk.witness import WitnessGraphML, WitnessHarness
+
+
+def line_contains(line, *args):
+    return any((a in line for a in args))
+
+
+def get_witnesses(args, resultsdir, line):
+    """
+    Get witness object referencing the right GraphML file
+    that corresponds to the found error (based on the error message)
+    """
+
+    witnesses = []
+
+    # [38] /opt/bubaak/tests/svcomp/termination-bwb/not-02-false.c:18:14: [non-termination]: an infinite execution found
+    try:
+        state_n = int(line.split()[0][1:-1])
+    except ValueError:
+        return None
+
+    # the files may not exist right now, so do not check for their existence
+    # (if needed, we can wait for their creation as we do with KLEE files
+    #  that we need to parse)
+    if "-sv-comp-witness" in args:
+        witnesses.append(WitnessGraphML(path=f"{resultsdir}/witness-{state_n}.graphml"))
+    if "-gen-harness" in args:
+        witnesses.append(WitnessHarness(path=f"{resultsdir}/harness-{state_n}.c"))
+
+    return witnesses or None
+
+
+class SlowBeastParser(ToolOutputParser):
+    def __init__(self, properties, args, resultsdir):
+        super().__init__(f"{resultsdir}/stdout.txt", f"{resultsdir}/stderr.txt")
+        self._properties = properties
+        self._no_error_found = False
+        self._killed_paths = []
+        self._errors = []
+        self._retval = None
+        self._args = args
+        self._outdir = resultsdir
+
+    def is_bse(self):
+        return "-bself" in self._args or "-bse" in self._args
+
+    def try_get_prp(self, key):
+        for p in self._properties:
+            if p.key() == key:
+                return p
+        return None
+
+    def get_prp(self, key):
+        prp = self.try_get_prp(key)
+        if prp is None:
+            raise RuntimeError(f"Did not find property: {key}")
+        return prp
+
+    def add_error_or_killed(self, prpkey, line):
+        prp = self.get_prp(prpkey)
+        if prp:
+            self._errors.append(
+                Verdict(
+                    Verdict.INCORRECT,
+                    prp,
+                    line,
+                    witness=get_witnesses(self._args, self._outdir, line),
+                )
+            )
+        else:
+            self._killed_paths.append(Verdict(Verdict.UNKNOWN, None, line))
+
+    def parse_stderr_ev(self, ev, line):
+        assert ev == "line-stderr"
+        self._parse_stderr(line.decode("utf-8"))
+
+    def parse_stdout_ev(self, ev, line):
+        assert ev == "line-stdout"
+        self._parse_stdout(line.decode("utf-8"))
+
+    def _parse_stdout(self, line):
+        if line.startswith("Found errors:"):
+            if line == "Found errors: 0\n":
+                self._no_error_found = True
+        if line.startswith("Killed paths:"):
+            num = int(line.split()[2])
+            if num == 0:
+                # BSELF does not report the paths correctly right now
+                pass  # assert len(self._killed_paths) == 0
+            elif num > 0 and len(self._killed_paths) == 0:
+                # slowbeast killed a path, but we didn't catch the warning
+                # (maybe there was not one). Add at least this line
+                self._killed_paths.append(line)
+        if "KILLED STATE: " in line or "Interrupted..." in line:
+            self._killed_paths.append(line)
+
+    def _parse_stderr(self, line):
+        if "[assertion error]:" in line and (
+            "reachable" in line or "error function called" in line
+        ):
+            self.add_error_or_killed("unreach", line)
+        elif "[non-termination]: an infinite execution found" in line:
+            self.add_error_or_killed("termination", line)
+        elif "[assertion error]:" in line and line_contains(
+            line, "signed integer overflow", "signed integer underflow"
+        ):
+            self.add_error_or_killed("no-signed-overflow", line)
+        elif "[memory error] - uninitialized read" in line:
+            self._killed_paths.append(line)
+        elif self.is_bse() and "Ignoring function pointer call: " in line:
+            self._killed_paths.append(line)
+
+    def finish(self, retcode):
+        self._retval = retcode
+
+    def result(self):
+        if self._errors:
+            assert not self._no_error_found
+            return self._errors
+        if self._retval is None:
+            return None
+        if self._retval == 0:
+            if self._killed_paths:
+                return [Verdict(Verdict.UNKNOWN, None, kp) for kp in self._killed_paths]
+            if not self._no_error_found:
+                return [
+                    Verdict(
+                        Verdict.ERROR,
+                        None,
+                        f"inconsistency: no_error_found = {self._no_error_found}, errors = {self._errors}, killed_paths = {self._killed_paths}",
+                    )
+                ]
+            return [
+                Verdict(
+                    Verdict.CORRECT,
+                    prp,
+                    witness=WitnessGraphML(
+                        path=f"{self._outdir}/correctness-witness.graphml"
+                    ),
+                )
+                for prp in self._properties
+            ]
+        return [Verdict(Verdict.ERROR, None, f"retval: {self._retval}")]
+
+
+class SlowBeast(Tool):
+    instance_counter = 0
+
+    def __init__(
+        self,
+        bitcode,
+        properties,
+        args=None,
+        name="slowbeast",
+        timeout=None,
+    ):
+        the_args = args.copy() if args else []
+
+        self._out_dir = f"{get_env().workdir}/sb-{SlowBeast.instance_counter}"  # mkdtemp(prefix="sb-out.")
+        makedirs(self._out_dir, exist_ok=True)
+        SlowBeast.instance_counter += 1
+        the_args.extend(("-out-dir", self._out_dir))
+
+        for prp in properties:
+            if prp.is_unreach():
+                for fn in prp.error_funs():
+                    the_args.extend(["-error-fn", fn])
+
+        new_env = environ.copy()
+        new_env["PYTHONOPTIMIZE"] = "1"
+
+        super().__init__(
+            f"{get_env().srcdir}/slowbeast/sb",
+            inputs=[bitcode],
+            args=the_args,
+            name=name,
+            envir=new_env,
+            timeout=timeout,
+        )
+
+        self._parser = SlowBeastParser(properties, args, self.resultsdir())
+        self.add_event_listener("line-stdout", self, self._parser.parse_stdout_ev)
+        self.add_event_listener("line-stderr", self, self._parser.parse_stderr_ev)
+
+    def resultsdir(self):
+        return self._out_dir
+
+    def finish(self):
+        super().finish()  # get the retval
+
+        self._parser.finish(self.retval().retval)
+        return TaskResult("DONE", self._parser.result(), task=self)
+
+
+def get_slowbeast_args(args, properties, options=None):
+    options = options or []
+    if args.X:
+        options.extend(args.X)
+    have_termination = False
+    for prp in properties:
+        if not prp.is_unreach():
+            if prp.is_no_signed_overflow():
+                options.extend(("-check", "no-overflow"))
+            else:
+                options.extend(("-check", prp.key()))
+        if prp.is_termination():
+            have_termination = True
+            if "-bself" in options:
+                raise NotImplementedError("BSELF does not support termination")
+
+    if "-bself" in options:
+        options.append("-forbid-floats")
+        options.append("-forbid-threads")
+
+    if args.sv_comp:
+        # ["-pointer-bitwidth", str(args.pointer_bitwidth)]
+        # options += ["-svcomp-witness", "-se-exit-on-error", "-se-replay-errors"]
+        options += ["-svcomp-witness", "-exit-on-error"]
+        # XXX: we replay errors in reach and overflows for now to find bugs
+        # if not have_termination:
+        #     options.append("-replay-error")
+
+    if args.exec_witness or args.harness:
+        options.append("-gen-harness")
+    return options
+-e 
+
+========================================
+FILE: ./tools/svcomptool.py
+========================================
+from importlib import import_module
+from os import makedirs, listdir
+from os.path import exists, isdir, isfile, basename
+from urllib.request import urlretrieve
+from tempfile import mkdtemp
+from shutil import move as move_file
+
+from benchexec.tooladapter import create_tool_locator, CURRENT_BASETOOL
+from benchexec.util import ProcessExitCode
+from yaml import safe_load as yaml_safe_load, YAMLError
+import re
+
+from bbk.dbg import dbg
+from bbk.env import get_env
+from bbk.properties import PropertiesSet, Property
+from bbk.task.aggregatetask import AggregateTask
+from bbk.task.processtask import ProcessTask
+from bbk.task.result import TaskResult
+from bbk.utils import find_file_in_path, _popen
+from bbk.verdict import Verdict
+
+CACHEDIR = f"{get_env().srcdir}/svcomptools"
+
+
+class Download(ProcessTask):
+    """
+    Download a file. This task uses `wget` or `curl`
+    and thus is suitable for larger files that we want to download
+    asynchronously. For small files that are downloaded instanteously,
+    you can use the python urllib module that blocks util the file
+    is downloaded (but that is not a problem if it takes say milliseconds).
+    """
+
+    def __init__(self, url, path):
+        """
+        Download file given by `url` and save it to `path`.
+        """
+        super().__init__()
+
+        self._url = url
+        self._path = path
+
+        exe = find_file_in_path("curl")
+        if exe is None:
+            exe = find_file_in_path("wget")
+            self._cmd = [exe, url, "-o", path]
+        else:
+            self._cmd = [exe, "-LR", url, "-o", path]
+
+    def cmd(self):
+        return self._cmd
+
+    def finish(self):
+        result = super().finish()
+        if result.status == "DONE":
+            return TaskResult("DONE", output=self._path)
+        return result
+
+
+class Unzip(ProcessTask):
+    """
+    Unzip a file. This task uses `unzip` program.
+    """
+
+    def __init__(self, zipfile, path, opts=None):
+        """
+        Download file given by `url` and save it to `path`.
+        """
+        super().__init__(name="unzip")
+
+        self._zipfile = zipfile
+        self._path = path
+
+        exe = find_file_in_path("unzip")
+        if exe is None:
+            raise RuntimeError("unzip not found")
+        else:
+            self._cmd = [exe] + (opts or []) + [zipfile, "-d", path]
+
+    def cmd(self):
+        return self._cmd
+
+    def finish(self):
+        result = super().finish()
+        if result.status == "DONE":
+            return TaskResult("DONE", output=self._path)
+        return result
+
+
+def get_tool_yml_file(toolname, use_cache):
+    """
+    Download the SV-COMP tool's yaml file. It is small,
+    so do it directy via python, not via a task.
+    """
+    path = f"{CACHEDIR}/{toolname}.yml"
+    if use_cache and exists(path):
+        return path
+
+    urlretrieve(
+        f"https://gitlab.com/sosy-lab/benchmarking/fm-tools/-/raw/main/data/{toolname}.yml",
+        path,
+    )
+    assert exists(path)
+    return path
+
+
+def get_tool_yml(toolname, use_cache):
+    path = get_tool_yml_file(toolname, use_cache)
+    with open(path, "r") as f:
+        try:
+            yml = yaml_safe_load(f)
+        except YAMLError as exc:
+            yml = None
+
+    return yml
+
+
+def get_tool_url(yml, toolname, year=None):
+    if year is None:
+        # use the top-most version which is likely
+        # the newest
+        data = yml["versions"][0]
+    else:
+        RuntimeError("Selecting a year is not implemented yet")
+
+    doi_url = f"https://doi.org/{data['doi']}"
+
+    # XXX: Doesn't work for some reason
+    # with urlopen(doi_url) as url:
+    #    return url.geturl()
+    p = _popen(["curl", doi_url])
+    stdout, stderr = p.communicate()
+    assert p.returncode == 0
+    r = re.search(b'href=".*zenodo\.(.*)"', stdout)
+    assert r
+    identifier = int(r[1])
+    return f"https://zenodo.org/api/records/{identifier}/files-archive"
+
+
+def prp_to_file(prp: Property):
+    if prp.is_unreach():
+        return "unreach-call.prp"
+    if prp.is_memcleanup():
+        return "valid-memcleanup.prp"
+    if prp.is_memsafety():
+        return "valid-memsafety.prp"
+    if prp.is_termination():
+        return "termination.prp"
+    if prp.is_def_behavior():
+        return "def-behavior.prp"
+    if prp.is_no_signed_overflow():
+        return "no-overflow.prp"
+
+    raise RuntimeError("Unknown property")
+
+
+class GetSVCompTool(AggregateTask):
+    def __init__(self, toolname, properties, year=None, use_cache=True):
+        super().__init__([])
+        self._use_cache = use_cache
+        self._year = year
+        self._toolname = toolname
+        self._properties = PropertiesSet(*properties)
+        self._zipfile = f"{CACHEDIR}/{toolname}.zip"
+        self._tooldir = f"{CACHEDIR}/{toolname}"
+
+        assert self._properties.is_single()
+        self._prpfile = f"{CACHEDIR}/{prp_to_file(self._properties.get_single())}"
+
+        makedirs(CACHEDIR, exist_ok=True)
+
+    def execute(self):
+        toolname = self._toolname
+
+        # TODO: move this into its own task?
+        if not self._use_cache or not exists(self._prpfile):
+            prpfile = prp_to_file(self._properties.get_single())
+            dld = Download(
+                f"https://gitlab.com/sosy-lab/benchmarking/sv-benchmarks/-/raw/main/c/properties/{prpfile}",
+                self._prpfile,
+            )
+            self.add_subtask(dld)
+
+        if self._use_cache and isdir(f"{CACHEDIR}/{toolname}"):
+            dbg("GetSVCompTool: the tool is in cache")
+            return
+
+        def unzip_cb(ev, task, result):
+            # we unzipped a zip that contains a zip
+            # into a temporary directory. Unzipped the zip to our cache.
+            listdir(result.output)
+            tmpdir = result.output
+            unzipped_dir = f"{tmpdir}/unzipped"
+
+            def move_unzipped_file(result):
+                if result.is_done():
+                    flname = listdir(unzipped_dir)[0]
+                    dbg(f"Moving {unzipped_dir}/{flname} -> {self._tooldir}")
+                    move_file(f"{unzipped_dir}/{flname}", self._tooldir)
+                return result
+
+            for fl in listdir(tmpdir):
+                if fl.endswith(".zip"):
+                    unzip = (
+                        Unzip(f"{result.output}/{fl}", unzipped_dir)
+                        >> move_unzipped_file
+                    )
+                    self.add_subtask(unzip)
+                    return
+            raise RuntimeError("Downloaded zip has wrong structure")
+
+        if not self._use_cache or not exists(self._zipfile):
+            yml = get_tool_yml(toolname, self._use_cache)
+            url = get_tool_url(yml, self._toolname)
+
+            dbg(f"Downloading {self._toolname} from {url}")
+            dld = Download(url, self._zipfile)
+            self.add_subtask(dld)
+
+            def finish_cb(ev: str, task, result):
+                assert ev == "finish", ev
+                # we downloaded, so we need to also unzip
+                unzip = Unzip(self._zipfile, mkdtemp(dir="/tmp"))
+                unzip.add_event_listener("finish", self, unzip_cb)
+                self.add_subtask(unzip)
+
+            dld.add_event_listener("finish", self, finish_cb)
+        else:
+            if not self._use_cache or not isdir(f"{CACHEDIR}/{toolname}"):
+                # use the Unzip task instead of the python zip module, because the
+                # python module removes file permissions
+                unzip = Unzip(self._zipfile, mkdtemp(dir="/tmp"))
+                unzip.add_event_listener("finish", self, unzip_cb)
+                self.add_subtask(unzip)
+
+    def aggregate(self, task, result):
+        if not result.is_done():
+            return result
+
+    def finish(self):
+        if not isdir(f"{CACHEDIR}/{self._toolname}"):
+            return TaskResult("ERROR", "Failed getting the SV-COMP tool")
+
+        return TaskResult("DONE", output=f"{CACHEDIR}/{self._toolname}")
+
+
+def svcomp_result_to_verdict(result, property):
+    if result.startswith("false"):
+        return Verdict(Verdict.INCORRECT, property, info=result)
+    if result.startswith("true"):
+        return Verdict(Verdict.CORRECT, property, info=result)
+
+    if result.lower().startswith("error"):
+        return Verdict(Verdict.ERROR, property, info=result)
+
+    return Verdict(Verdict.UNKNOWN, property, info=result)
+
+
+class BenchexecConfig:
+    def __init__(self, toolname):
+        self.tool_directory = f"{CACHEDIR}/{toolname}"
+
+
+class SVCompTool(ProcessTask):
+    instance_counter = 0
+
+    def __init__(self, toolname: str, programs, properties, args=None, timeout=None, bitwidth = 32):
+        self._resultsdir = (
+            f"{get_env().workdir}/svcomptool-{SVCompTool.instance_counter}-{toolname}"
+        )
+        SVCompTool.instance_counter += 1
+        self._tooldir = f"{CACHEDIR}/{toolname}"
+
+        self._inputs = [p.path for p in programs]
+
+        self._output = []
+        self._properties = PropertiesSet(*properties)
+        assert self._properties.is_single()
+        assert isdir(self._tooldir), f"Missing {self._tooldir}"
+        self._prpfile = f"{CACHEDIR}/{prp_to_file(self._properties.get_single())}"
+        assert isfile(self._prpfile)
+
+        yml = get_tool_yml(toolname, use_cache=True)
+        toolinfo = yml["benchexec_toolinfo_module"]
+        if toolinfo.endswith(".py"):
+            toolinfo = f"benchexec.tools.{basename(toolinfo)[:-3]}"
+        elif not toolinfo.startswith("benchexec."):
+            toolinfo = f"benchexec.tools.{toolname}"
+
+        # FIXME: get the name of module from YML
+        benchexec_mod = import_module(toolinfo)
+        self._benchexec_tool = benchexec_mod.Tool()
+        exe = self._benchexec_tool.executable(
+            create_tool_locator(BenchexecConfig(toolname))
+        )
+
+        # TODO
+        rlimits = CURRENT_BASETOOL.ResourceLimits(walltime=timeout or 0)
+        # assume the top-most version is the current one
+        options = yml["versions"][0]["benchexec_toolinfo_options"] + (args or [])
+
+        task_options = {"language": "C", "data_model": "LP64" if bitwidth == 64 else "ILP32"}
+        task = CURRENT_BASETOOL.Task(
+            [p.path for p in programs], None, self._prpfile, task_options
+        )
+
+        cmd = self._benchexec_tool.cmdline(exe, options, task, rlimits)
+        super().__init__(
+            cmd,
+            name=f"svcomptool-{toolname}",
+            # timeout=timeout,
+            envir=None,
+            cwd=self._tooldir,
+        )
+
+        # track the output of the tool so that we can determine the result
+        def gather_output(ev, line):
+            self._output.append(line.decode("utf-8"))
+
+        self.add_event_listener("line-stderr", self, gather_output)
+        self.add_event_listener("line-stdout", self, gather_output)
+
+    def get_verdict(self):
+        run = CURRENT_BASETOOL.Run(
+            cmdline=self.cmd(),
+            exit_code=ProcessExitCode(
+                value=self.retval().retval, signal=None, raw=self.retval().retval
+            ),
+            output=CURRENT_BASETOOL.RunOutput(lines=self._output),
+            termination_reason="done",
+        )
+        result = svcomp_result_to_verdict(
+            self._benchexec_tool.determine_result(run), self._properties.get_single()
+        )
+        return [result]
+
+    def finish(self):
+        super().finish()  # get the retval
+        return TaskResult("DONE", output=self.get_verdict(), task=self)
+-e 
+
+========================================
+FILE: ./tools/timeout.py
+========================================
+from bbk.verdict import Verdict
+from bbk.utils import _popen
+from bbk.tool import ToolOutputParser, Tool
+
+
+class TimeoutParser(ToolOutputParser):
+    def __init__(self):
+        self._finished = False
+
+    def parse(self, line, stream):
+        pass
+
+    def finish(self, _):
+        self._finished = True
+
+    def result(self):
+        if self._finished:
+            return [Verdict(Verdict.UNKNOWN, None, "timeout")]
+        return None
+
+
+class Timeout(Tool):
+    def __init__(self, args=None, parser=None, name="timeout"):
+        assert isinstance(args, int), args
+        super().__init__("sleep", [str(args)], parser or TimeoutParser(), name)
+
+    def start(self, progs, add_options=None):
+        cmd = [self.exe(), self._args[0]] + (add_options or [])
+        print(f"## Run {self.name()}")
+        print("#", " ".join(cmd))
+        self._proc = _popen(cmd)
+        return self._proc
+-e 
+
+========================================
+FILE: ./tools/tooloutputparser.py
+========================================
+class ToolOutputParser:
+    def __init__(self, store_stdout=None, store_stderr=None):
+        """
+        Parameters:
+          store_stdout: str, opened file, or None: store stdout to the given file
+          store_stderr: str, opened file, or None: store stderr to the given file
+        """
+        self._log_stdout = store_stdout
+        self._log_stderr = store_stderr
+
+    def log_stdout(self, line):
+        if self._log_stdout is None:
+            return
+
+        # In ctor we store only the path and open it lazily only now.
+        # The main reason is that the tools may overwrite or clean
+        # the directory where the log is going to be on their
+        # startup and this way we'll create the file only after the
+        # tool were initialized
+        if isinstance(self._log_stdout, str):
+            self._log_stdout = open(self._log_stdout, "w")
+
+        self._log_stdout.write(line)
+        self._log_stdout.write("\n")
+
+    def log_stderr(self, line):
+        if self._log_stderr is None:
+            return
+
+        # In ctor we store only the path and open it lazily only now.
+        # The main reason is that the tools may overwrite or clean
+        # the directory where the log is going to be on their
+        # startup and this way we'll create the file only after the
+        # tool were initialized
+        if isinstance(self._log_stderr, str):
+            self._log_stderr = open(self._log_stderr, "w")
+
+        self._log_stderr.write(line)
+        self._log_stderr.write("\n")
+
+    def __del__(self):
+        if self._log_stdout and hasattr(self._log_stdout, "close"):
+            self._log_stdout.close()
+        if self._log_stderr and hasattr(self._log_stderr, "close"):
+            self._log_stderr.close()
+        del self
+
+    def parse(self, line: bytes, stream: str):
+        """
+        Called for each line of the tool's output.
+        @param stream is either "stdout" or "stderr".
+        If something else None is returned,
+        it is assumed to be the TaskResult()
+        """
+        line_s = line.decode("utf-8", "ignore")
+        if stream == "stdout":
+            self.log_stdout(line_s)
+            return self._parse_stdout(line_s.strip())
+        elif stream == "stderr":
+            self.log_stderr(line_s)
+            return self._parse_stderr(line_s.strip())
+        else:
+            raise RuntimeError(f"Unknown stream: {stream}")
+
+    def _parse_stdout(self, _):
+        return None
+
+    def _parse_stderr(self, _):
+        return None
+
+    def finish(self, retcode):
+        """Called when the tool finishes"""
+        raise NotImplementedError(f"{self.__class__}.finish() not implemented")
+-e 
+
+========================================
+FILE: ./tools/__init__.py
+========================================
+-e 
+
+========================================
+FILE: ./utils.py
+========================================
+from subprocess import Popen, PIPE
+from .dbg import print_stderr
+from .env import get_env
+from os.path import isfile
+from os import environ
+
+
+def err(msg):
+    print_stderr(msg, color="RED")
+    exit(1)
+
+
+def find_file_in_dirs(name, dirs):
+    for path in dirs:
+        pathfile = f"{path}/{name}"
+        if isfile(pathfile):
+            return pathfile
+    if dirs:
+        if isfile(pathfile):
+            return pathfile
+
+    return None
+
+
+def find_program(name, dirs=None):
+    if dirs:
+        pathfile = find_file_in_dirs(name, dirs)
+    if pathfile is None:
+        tmp = f"{get_env().srcdir}/{name}/bin/{name}"
+        if isfile(tmp):
+            return tmp
+
+        pathfile = find_file_in_path(name)
+
+    return pathfile
+
+
+def find_file_in_path(name):
+    return find_file_in_dirs(name, environ["PATH"].split(":"))
+
+
+def _popen(cmd, env=None, cwd=None):
+    try:
+        p = Popen(cmd, stdout=PIPE, stderr=PIPE, env=env, cwd=cwd)
+    except FileNotFoundError as e:
+        print_stderr(str(e), color="red")
+        return None
+    return p
+-e 
+
+========================================
+FILE: ./verdict.py
+========================================
+from bbk.dbg import print_stdout
+
+
+def result_kind_to_str(val):
+    if val == Verdict.CORRECT:
+        return "CORRECT"
+    if val == Verdict.INCORRECT:
+        return "INCORRECT"
+    if val == Verdict.UNKNOWN:
+        return "UNKNOWN"
+    if val == Verdict.ERROR:
+        return "ERROR"
+    if val == Verdict.TIMEOUT:
+        return "TIMEOUT"
+    raise RuntimeError(f"Unknown result code: {val}")
+
+
+class Verdict:
+    CORRECT = 1
+    INCORRECT = 2
+    UNKNOWN = 3
+    ERROR = 4
+    TIMEOUT = 5
+
+    def __init__(self, kind, prp, info: str = "", witness=None):
+        """
+        @param ty is from the enum
+        """
+        self._kind = kind
+        self._prp = prp
+        self._info = info
+        self._witness = witness
+
+    def is_correct(self):
+        return self._kind == Verdict.CORRECT
+
+    def is_incorrect(self):
+        return self._kind == Verdict.INCORRECT
+
+    def is_unknown(self):
+        return self._kind == Verdict.UNKNOWN
+
+    def is_error(self):
+        return self._kind == Verdict.ERROR
+
+    def is_timeout(self):
+        return self._kind == Verdict.TIMEOUT
+
+    def prp(self):
+        return self._prp
+
+    def info(self):
+        return self._info
+
+    def witness(self):
+        return self._witness
+
+    def __repr__(self):
+        return f"Verdict({result_kind_to_str(self._kind)}, {self._prp}, {self._witness}, '{self._info[:20]}')"
+
+    def describe(self):
+        def prp_key(prp):
+            return prp.key() if prp else "_any_"
+
+        if self.is_incorrect():
+            print_stdout(
+                f"Property {prp_key(self.prp())} is violated\n{self.info() or ''}",
+                color="red",
+            )
+        elif self.is_correct():
+            print_stdout(
+                f"Property {prp_key(self.prp())} holds\n{self.info() or ''}",
+                color="green",
+            )
+        else:
+            print_stdout(
+                f"Validity of property {prp_key(self.prp())} is unknown\n{self.info() or ''}",
+                color="orange",
+            )
+-e 
+
+========================================
+FILE: ./version.py
+========================================
+from os.path import isdir, isfile, dirname, abspath
+from os import chdir, getcwd
+from subprocess import run, PIPE
+from sys import argv
+
+VERSION_STRING = "0.9.3"
+
+
+def get_git_version(srcdir):
+    if isfile(f"{srcdir}/git-version.txt"):
+        with open(f"{srcdir}/git-version.txt", "r") as f:
+            line = f.readline()
+            return line
+    if isdir(f"{srcdir}/.git"):
+        olddir = getcwd()
+        chdir(srcdir)
+        res = run(["git", "rev-parse", "HEAD"], stdout=PIPE)
+        chdir(olddir)
+        if res.returncode == 0:
+            return res.stdout[:40].decode("ascii", "ignore")
+    return None
+
+
+def get_version():
+    srcdir = abspath(dirname(argv[0]))
+    gitvers = get_git_version(srcdir)
+    if gitvers:
+        return f"{VERSION_STRING}-{gitvers[:6]}"
+    return VERSION_STRING
+-e 
+
+========================================
+FILE: ./witness.py
+========================================
+class Witness:
+    """
+    Class representing a counter-example to the property or
+    a proof that a property holds
+    """
+
+    def is_graphml(self):
+        return False
+
+    def is_harness(self):
+        return False
+
+
+class WitnessGraphML(Witness):
+    """
+    SV-COMP GraphMLWitness. It is either a link to a file
+    or the whole XML data.
+    """
+
+    def __init__(self, path=None, data=None):
+        self.path = path
+        self.data = data
+
+    def is_graphml(self):
+        return True
+
+
+class WitnessHarness(Witness):
+    """
+    C file that fills in non-deterministic behavior when linked with the
+    program.
+    """
+
+    def __init__(self, path=None, data=None):
+        self.path = path
+        self.data = data
+
+    def is_harness(self):
+        return True
+-e 
+
+========================================
+FILE: ./workflow.py
+========================================
+from select import POLLIN, POLLHUP
+from time import clock_gettime, CLOCK_REALTIME
+
+from bbk.dbg import dbg, dbgv, print_stdout, wdbg
+from bbk.env import get_env
+from bbk.poller import Poller
+from bbk.task.processtask import ProcessTask
+from bbk.task.result import TaskResult
+
+STOPPED_TASK_WAIT_BEFORE_KILLING = 10  # seconds
+POLL_TIMEOUT_INIT = 2  # miliseconds
+
+
+def is_final_result(task, result):
+    return task.parent() is None and not result.is_continuation()
+
+
+def finish_fd_task(fd, poller, workflow):
+    # Tool finishes/crash... Read all what is left on
+    # this fd and the other fd of the task
+    task, _ = poller.get_data(fd)
+    assert fd in task.fds()
+    for n, task_fd in enumerate(task.fds()):
+        tmp_stream = "stdout" if n == 0 else "stderr"
+        while read_fd(task_fd, task, tmp_stream):
+            pass
+
+    # remove fds from poller
+    workflow.remove_task(task)
+    result = workflow.finish_task(task)
+    if result:
+        if is_final_result(task, result):
+            # we've got a result, stop all workflow and
+            # return the result
+            workflow.stop()
+            return result, task
+        print_stdout("----------------")
+        print_stdout(f"{task.name()} finished with the following results:")
+        # result.describe()
+    return None
+
+
+def read_fd(fd, task, stream):
+    assert isinstance(task, ProcessTask), (task, type(task))
+    # TODO: set stream based on the FD (compare it to the data in task)
+    if stream == "stdout":
+        fl = task.proc().stdout
+        assert fd == task.proc().stdout.fileno()
+        is_stdout = True
+    elif stream == "stderr":
+        fl = task.proc().stderr
+        assert fd == task.proc().stderr.fileno()
+        is_stdout = False
+    else:
+        raise RuntimeError(f"Unknown stream: {stream}")
+
+    assert fd == fl.fileno()
+
+    partial_lines = task._partial_output
+    line = fl.readline()
+    if line:
+        ln = line.decode("utf-8", "ignore")
+        if ln[-1] not in ("\n", "\r"):
+            partial_lines.setdefault(stream, []).append(line)
+            return False
+        elif stream in partial_lines:
+            assert "\n" in ln, ln
+            line = (b"".join(partial_lines[stream])) + line
+            ln = line.decode("utf-8")
+            # reset the partial output
+            task._partial_output = {}
+
+        if __debug__:
+            header = f"{task.name()}[{task.proc().pid}]/{1 if is_stdout else 2}"
+            dbgv(
+                f"  ##[{header:20}] '{ln.rstrip()}'",
+                color="gray",
+            )
+        if is_stdout:
+            task.emit_event("line-stdout", line)
+        else:
+            task.emit_event("line-stderr", line)
+        return True
+    return False
+
+
+class Workflow:
+    instance = 0
+
+    def __init__(self, tasks=None):
+        Workflow.instance += 1
+
+        self._id = Workflow.instance
+        self._poller = Poller()
+        self._running = False
+        self._tasks = []
+        self._fd_tasks = []
+        self._no_fd_tasks = []
+        self._new_tasks = []
+        # debugging log
+        self._log = None
+
+        for task in tasks or ():
+            self.add_task(task)
+
+    def get_id(self):
+        return self._id
+
+    def add_task(self, task):
+        wdbg().msg(f"{self}.add_task({task})")
+
+        task.set_workflow(self)
+        self._new_tasks.append(task)
+
+        if task.is_program():
+            self._fd_tasks.append(task)
+        else:
+            self._no_fd_tasks.append(task)
+
+    def _start_task(self, task):
+        wdbg().msg(f"{self}.start_task({task})")
+        task.execute()
+        if not task.is_running() and not task.is_done():
+            wdbg().msg(f"Failed starting task {task}")
+            raise RuntimeError(f"Failed starting task {task}")
+
+        self._tasks.append(task)
+        if task.is_program():
+            self._poller.add_task(task)
+
+    def has_work(self):
+        return len(self._tasks) > 0 or len(self._new_tasks) > 0
+
+    def run(self):
+        self._running = True
+        return self._main_loop()
+
+    def _main_loop(self):
+        wdbg().msg(f"{self}._main_loop()")
+        poller = self._poller
+        poll_timeout = 10
+
+        assert self._running
+        has_work = self.has_work
+        assert has_work(), "Has no work when starting"
+
+        last_current_time = clock_gettime(CLOCK_REALTIME)
+
+        while has_work():
+            current_time = clock_gettime(CLOCK_REALTIME)
+
+            if current_time - last_current_time > 20:
+                dbg(
+                    f"## @{current_time - get_env().start_time:.3f} has {len(self._tasks)} tasks running..."
+                )
+                if __debug__:
+                    for task in self._tasks:
+                        dbg(f"##   -> {task}")
+                last_current_time = current_time
+
+            if self._new_tasks:
+                new_tasks = self._new_tasks
+                self._new_tasks = []
+                for task in new_tasks:
+                    self._start_task(task)
+
+                # something happend, re-set poll_timeout
+                poll_timeout = POLL_TIMEOUT_INIT
+
+            ### -----------------------------------------------------
+            ### check non-fd tasks
+            ### -----------------------------------------------------
+            for task in self._no_fd_tasks:
+                if task.is_done():
+                    result = self.finish_task(task)
+                    self.remove_task(task)
+                    if result and is_final_result(task, result):
+                        self.stop()
+                        return result, task
+
+                    # something happend, re-set poll_timeout
+                    poll_timeout = POLL_TIMEOUT_INIT
+
+            ### -----------------------------------------------------
+            ### check fd tasks
+            ### -----------------------------------------------------
+            poll_fds = poller.poll(timeout=poll_timeout)
+            poll_timeout = 2 * poll_timeout if poll_timeout < 300 else 333
+
+            for fd, ev in poll_fds:
+                # something happend, re-set poll_timeout
+                poll_timeout = POLL_TIMEOUT_INIT
+
+                if ev & POLLIN:
+                    # There is somthing on the output of the tool
+                    read_fd(fd, *poller.get_data(fd))
+                if ev == POLLHUP:
+                    results = finish_fd_task(fd, poller, self)
+                    if results is None:
+                        break
+                    return results
+
+            ### -----------------------------------------------------
+            ### check timeout-ed tasks
+            ### -----------------------------------------------------
+            for task, timeout in self.get_timeouted_tasks(current_time):
+                if task.was_stopped():
+                    # the task has been already stopped
+                    continue
+
+                print_stdout(f"Tool '{task.name()}' reached timeout {timeout}s")
+                self.stop_task(task)
+                # Fake the result in case it takes more time to stop the task.
+                # This way its listeners can continue and do not need to wait
+                # until the `stop` method (over which  we have no control anyway)
+                # does its job
+                self._finish_task(task, TaskResult("TIMEOUT"))
+                if not has_work():
+                    # return timeout as the last task reached timeout
+                    # this is mainly for debugging, without this, we just return 'unknown'
+                    return TaskResult("TIMEOUT"), None
+
+            ### -----------------------------------------------------
+            ### check stopped tasks
+            ### -----------------------------------------------------
+            for task in self._tasks:
+                if task.was_stopped():
+                    # Does it take too long to stop the task?
+                    if (
+                        current_time - task.stopped_time()
+                        > STOPPED_TASK_WAIT_BEFORE_KILLING
+                    ):
+                        # Kill and remove the task for good
+                        dbg(f"Stopping task {task} takes too long, killing it")
+                        self.stop_task(task)
+                        self.kill_task(task)
+                        self._finish_task(task, TaskResult("KILLED"))
+                        #self.remove_task(task)
+
+        assert not self._new_tasks
+        return None, None
+
+    def remove_task(self, task):
+        """
+        Remove the task from the poller and other data structures
+        """
+        wdbg().msg(f"{self}.remove_task({task})")
+
+        assert task in self._tasks, (task, self._tasks)
+        if task.is_program():
+            self._poller.remove_task(task)
+            self._fd_tasks.remove(task)
+        else:
+            self._no_fd_tasks.remove(task)
+        self._tasks.remove(task)
+
+    def finish_task(self, task):
+        result = task.finish()
+        assert result is not None
+        return self._finish_task(task, result)
+
+    def _finish_task(self, task, result):
+        wdbg().result(task, result)
+
+        if is_final_result(task, result):
+            return result
+
+        # We do not want to spawn new tasks if a task was stopped
+        if result.is_continuation() and task.was_stopped():
+            return None
+
+        if result.is_replace_task():
+            new_task = result.output
+            if task.parent():
+                task.parent().replace_subtask(task, new_task)
+            else:
+                self.add_task(new_task)
+            wdbg().replaces(new_task, task)
+            # this task is not finished yet
+            return None
+
+        if result.is_new_tasks():
+            for new_task in result.output:
+                self.add_task(new_task)
+
+        return None
+
+    def stop_task(self, task):
+        """
+        Stop the task.
+
+        Do not remove it, it will be done later by the main loop.
+        """
+        wdbg().msg(f"{self}.stop_task({task})")
+
+        assert task in self._tasks
+        task.stop()
+        assert task.was_stopped(), task
+
+    def kill_task(self, task):
+        """
+        Kill the task. It is assumed that stop_task() was called first,
+        that is that fds have been already removed from the poller.
+        """
+        wdbg().msg(f"{self}.kill_task({task})")
+        assert task.was_stopped(), task
+        task.kill()
+
+    def stop(self, exclude=None):
+        """Stop all tasks"""
+
+        for task in (t for t in self._tasks.copy() if t not in (exclude or ())):
+            self.stop_task(task)
+
+    def kill(self, exclude=None):
+        """Kill all tasks"""
+
+        for task in (t for t in self._tasks if t not in (exclude or ())):
+            self.kill_task(task)
+
+    def get_timeouted_tasks(self, current_time):
+        ret = []
+        for task in self._tasks:
+            assert task.start_time() > 0, task.start_time()
+            to = task.timeout()
+            if to is not None and (current_time - task.start_time() > to):
+                ret.append((task, task.timeout()))
+        return ret
+
+    def cleanup(self):
+        wdbg().msg(f"Cleanup workflow {self}")
+        # clean-up also still running tools if there are some
+        # -- but assert that there should not be any
+        for t in self._tasks:
+            self.stop_task(t)
+            self.kill_task(t)
+            t.cleanup()
+
+        if self._log:
+            self._log.write("\n}")
+            self._log.close()
+
+    def __repr__(self):
+        return f"Workflow-{self._id}"
+-e 
+
+========================================
+FILE: ./__init__.py
+========================================

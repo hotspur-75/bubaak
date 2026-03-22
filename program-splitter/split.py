@@ -537,9 +537,91 @@ def _handle_right_if_split(program_ast, split_node):
     target = f"assume_abort_if_not(!({condition}));\n{alternative}"
     return _replace(program_ast, split_node, target)
 
+class DomainSplitFinder(ASTVisitor):
+    def __init__(self, ast):
+        self.ast = ast
+        self.candidates = []
+        self._current_func = None
+
+    def visit_function_definition(self, node):
+        function_name_node = _name_node(node)
+        if function_name_node:
+            self._current_func = self.ast.match(function_name_node)
+        return True
+
+    def leave_function_definition(self, node):
+        self._current_func = None
+        return True
+
+    def visit_binary_expression(self, node):
+        if self._current_func != "main": return True
+        
+        op = self.ast.match(node.children[1]) 
+        if op in ["<", "<=", ">", ">=", "==", "!="]:
+            left = node.children[0]
+            right = node.children[2]
+            
+            # Extract the variable name
+            var_name = None
+            pivot_node = None
+            if left.type == "identifier" and right.type == "number_literal":
+                var_name = self.ast.match(left)
+                pivot_node = self.ast.match(right)
+            elif right.type == "identifier" and left.type == "number_literal":
+                var_name = self.ast.match(right)
+                pivot_node = self.ast.match(left)
+                
+            if var_name:
+                # SAFETY CHECK: Ignore floating point numbers (e.g., 100.0, 1e-5)
+                if "." in pivot_node or "e" in pivot_node.lower():
+                    return True
+                self.candidates.append((var_name, pivot_node))
+        return True
+
+def _try_domain_split(program_ast):
+    source_str = "\n".join(program_ast.source_lines)
+
+    if "/* BUBAAK_DOMAIN_SPLIT_APPLIED */" in source_str:
+        return None 
+        
+    finder = DomainSplitFinder(program_ast)
+    program_ast.visit(finder)
+    
+    if not finder.candidates:
+        return None
+        
+    from collections import Counter
+    ranked_candidates = Counter(finder.candidates).most_common()
+    
+    best_candidate = ranked_candidates[0][0]
+    key_var, pivot = best_candidate
+    
+    split_node = _find_split_point(program_ast)
+    if split_node is None: return None
+    
+    print(f"[*] Applied Domain Split on '{key_var}' at pivot '{pivot}'")
+    original_stmt = program_ast.match(split_node)
+    
+    # 1. Inject the assume natively without the extern declaration here
+    left_target = f"/* BUBAAK_DOMAIN_SPLIT_APPLIED */\n__VERIFIER_assume({key_var} < {pivot});\n{original_stmt}"
+    right_target = f"/* BUBAAK_DOMAIN_SPLIT_APPLIED */\n__VERIFIER_assume(!({key_var} < {pivot}));\n{original_stmt}"
+    
+    left_code = _replace(program_ast, split_node, left_target)
+    right_code = _replace(program_ast, split_node, right_target)
+    
+    # 2. Safely prepend the extern declaration to the global scope (top of the file)
+    extern_decl = "extern void __VERIFIER_assume(int);\n"
+    return extern_decl + left_code, extern_decl + right_code
 
 def _split_program_fn(source_code, unrolls = -1):
     program_ast = code_ast.ast(source_code, lang = "c", syntax_error = "warn")
+    
+    # 1. ATTEMPT DOMAIN SPLIT FIRST
+    domain_split_result = _try_domain_split(program_ast)
+    if domain_split_result is not None:
+        return domain_split_result # Returns (left, right)
+        
+    # 2. FALLBACK TO STANDARD SPLIT
     split_node = _find_split_point(program_ast)
     if split_node is None: raise ValueError("Function cannot be split")
 

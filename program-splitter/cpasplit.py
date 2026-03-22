@@ -15,6 +15,11 @@ import pycpa
 import pycpa.splitting
 from pycpa.splitting import run_splitter, run_deepening_splitter
 
+# --- ADD THESE TWO LINES ---
+import code_ast
+from split import _try_domain_split 
+# ---------------------------
+
 import pycpa.env
 from pycpa.env import global_timeout
 
@@ -109,6 +114,18 @@ def split_program(source_code : str, allowed_unrolls : int = -1, allowed_functio
 
 def _split_program_fn(source_code, unrolls = -1, clones = -1, deepening = False, trials = 10):
     
+    # --- NEW: ATTEMPT DOMAIN SPLIT FIRST ---
+    try:
+        program_ast = code_ast.ast(source_code, lang = "c", syntax_error = "warn")
+        domain_split_result = _try_domain_split(program_ast)
+        if domain_split_result is not None:
+            print("\n[*] SUCCESS: Intercepted and applied Domain Split in cpasplit.py!\n")
+            return list(domain_split_result) # Return [left_str, right_str]
+    except Exception as e:
+        print(f"[*] Domain split skipped/failed: {e}")
+    # ---------------------------------------
+
+    # --- FALLBACK: STANDARD CPA SPLITTER ---
     splits = [source_code]
     for _ in range(trials):
         try:
