@@ -537,81 +537,109 @@ def _handle_right_if_split(program_ast, split_node):
     target = f"assume_abort_if_not(!({condition}));\n{alternative}"
     return _replace(program_ast, split_node, target)
 
-class DomainSplitFinder(ASTVisitor):
-    def __init__(self, ast):
-        self.ast = ast
-        self.candidates = []
-        self._current_func = None
+import subprocess
+import tempfile
+import re
 
-    def visit_function_definition(self, node):
-        function_name_node = _name_node(node)
-        if function_name_node:
-            self._current_func = self.ast.match(function_name_node)
-        return True
-
-    def leave_function_definition(self, node):
-        self._current_func = None
-        return True
-
-    def visit_binary_expression(self, node):
-        if self._current_func != "main": return True
+def glean_bounds_from_oracle(source_code):
+    """
+    Runs the preprocessor on a sandbox copy of the code to resolve 
+    macros and hidden constants without affecting the original file.
+    """
+    with tempfile.NamedTemporaryFile(suffix=".c", mode='w') as tmp:
+        tmp.write(source_code)
+        tmp.flush()
         
-        op = self.ast.match(node.children[1]) 
-        if op in ["<", "<=", ">", ">=", "==", "!="]:
-            left = node.children[0]
-            right = node.children[2]
+        # Run clang preprocessor: -E (preprocess), -P (no line markers)
+        try:
+            result = subprocess.run(
+                ["clang", "-E", "-P", tmp.name], 
+                capture_output=True, text=True, timeout=5
+            )
+            if result.returncode != 0:
+                return {}
             
-            # Extract the variable name
-            var_name = None
-            pivot_node = None
-            if left.type == "identifier" and right.type == "number_literal":
-                var_name = self.ast.match(left)
-                pivot_node = self.ast.match(right)
-            elif right.type == "identifier" and left.type == "number_literal":
-                var_name = self.ast.match(right)
-                pivot_node = self.ast.match(left)
+            flattened_code = result.stdout
+            
+            # Now run the bound extraction on the flattened code
+            # We look for: var < NUMBER or NUMBER > var
+            bounds = {}
+            # Regex to find comparisons to integers
+            matches = re.findall(r'(\b\w+\b)\s*(<=|>=|<|>)\s*(\d+)', flattened_code)
+            for var, op, val_str in matches:
+                val = int(val_str)
+                if var not in bounds: 
+                    bounds[var] = {'lower': -float('inf'), 'upper': float('inf')}
                 
-            if var_name:
-                # SAFETY CHECK: Ignore floating point numbers (e.g., 100.0, 1e-5)
-                if "." in pivot_node or "e" in pivot_node.lower():
-                    return True
-                self.candidates.append((var_name, pivot_node))
-        return True
+                if '>' in op: bounds[var]['lower'] = max(bounds[var]['lower'], val)
+                if '<' in op: bounds[var]['upper'] = min(bounds[var]['upper'], val)
+            
+            return bounds
+        except Exception as e:
+            print(f"[*] Oracle Pass Failed: {e}")
+            return {}
 
 def _try_domain_split(program_ast):
     source_str = "\n".join(program_ast.source_lines)
 
+    # 1. ONE-AND-DONE & SENSITIVE DATA FILTER
     if "/* BUBAAK_DOMAIN_SPLIT_APPLIED */" in source_str:
         return None 
-        
-    finder = DomainSplitFinder(program_ast)
-    program_ast.visit(finder)
     
-    if not finder.candidates:
+    # STRICT TYPE FILTER: Skip floating point benchmarks to avoid Z3 lockups
+    if any(fp_type in source_str for fp_type in ["float ", "double ", "float*", "double*"]):
         return None
-        
-    from collections import Counter
-    ranked_candidates = Counter(finder.candidates).most_common()
+
+    # 2. GLEAN BOUNDS VIA PREPROCESSOR ORACLE
+    discovered_bounds = glean_bounds_from_oracle(source_str)
     
-    best_candidate = ranked_candidates[0][0]
-    key_var, pivot = best_candidate
-    
+    best_var, calculated_pivot = None, None
+    for var, limits in discovered_bounds.items():
+        if var in ['i', 'j', 'k', 'counter', '__retres']: continue
+        if limits['lower'] != -float('inf') and limits['upper'] != float('inf'):
+            if limits['lower'] < limits['upper']:
+                best_var = var
+                calculated_pivot = (limits['lower'] + limits['upper']) // 2
+                break
+
+    if not best_var:
+        return None
+
+    # 3. ROBUST INJECTION POINT
+    # Try to find a split node, otherwise fallback to the start of main()
     split_node = _find_split_point(program_ast)
-    if split_node is None: return None
     
-    print(f"[*] Applied Domain Split on '{key_var}' at pivot '{pivot}'")
+    # FALLBACK: If AST can't find a loop/branch, inject at the first line of main
+    if not split_node:
+        for child in program_ast.root_node.children:
+            if child.type == "function_definition":
+                name_node = child.child_by_field_name("declarator")
+                if name_node and "main" in program_ast.match(name_node):
+                    body = child.child_by_field_name("body")
+                    if body and len(body.children) > 1:
+                        split_node = body.children[1] # First statement after '{'
+                        break
+
+    if not split_node: return None
+
+    print(f"[*] ORACLE SUCCESS: Applying Midpoint for '{best_var}' at {calculated_pivot}")
     original_stmt = program_ast.match(split_node)
     
-    # 1. Inject the assume natively without the extern declaration here
-    left_target = f"/* BUBAAK_DOMAIN_SPLIT_APPLIED */\n__VERIFIER_assume({key_var} < {pivot});\n{original_stmt}"
-    right_target = f"/* BUBAAK_DOMAIN_SPLIT_APPLIED */\n__VERIFIER_assume(!({key_var} < {pivot}));\n{original_stmt}"
+    # 4. REDEFINITION PROTECTION: Wrap helper in #ifndef
+    klee_helper = (
+        "\n#ifndef BUBAAK_HELPERS_DEFINED\n"
+        "#define BUBAAK_HELPERS_DEFINED\n"
+        "extern void abort(void);\n"
+        "void assume_abort_if_not(int cond) { if(!cond) abort(); }\n"
+        "#endif\n"
+    )
     
-    left_code = _replace(program_ast, split_node, left_target)
-    right_code = _replace(program_ast, split_node, right_target)
+    marker = "/* BUBAAK_DOMAIN_SPLIT_APPLIED */\n"
+    left_target = f"{marker}assume_abort_if_not({best_var} < {calculated_pivot});\n{original_stmt}"
+    right_target = f"{marker}assume_abort_if_not(!({best_var} < {calculated_pivot}));\n{original_stmt}"
     
-    # 2. Safely prepend the extern declaration to the global scope (top of the file)
-    extern_decl = "extern void __VERIFIER_assume(int);\n"
-    return extern_decl + left_code, extern_decl + right_code
+    return klee_helper + _replace(program_ast, split_node, left_target), \
+           klee_helper + _replace(program_ast, split_node, right_target)
 
 def _split_program_fn(source_code, unrolls = -1):
     program_ast = code_ast.ast(source_code, lang = "c", syntax_error = "warn")
