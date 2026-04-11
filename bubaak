@@ -1,0 +1,330 @@
+#!/usr/bin/env python3
+
+
+# Workaround: Find a uniform way and include in Makefile -----------------------
+
+import os
+import sys
+
+lib_dir = os.path.join(os.path.dirname(__file__), "lib")
+
+sys.dont_write_bytecode = True  # prevent creation of .pyc files
+sys.path.insert(0, lib_dir)
+
+if "PYTHONPATH" not in os.environ:
+    os.environ["PYTHONPATH"] = ""
+
+os.environ["PYTHONPATH"] += os.pathsep + str(
+    lib_dir
+)  # necessary so subprocesses also use libraries
+
+# -----------------------------------------------------------------------------
+
+from importlib import import_module
+from os.path import abspath, dirname, basename, isfile
+from shutil import copyfile
+from subprocess import run
+from sys import setswitchinterval, argv, exit as sys_exit, path as sys_path
+from time import clock_gettime, CLOCK_REALTIME
+
+from bbk.cmdline import parse_arguments, setup_debugging, get_source_files
+from bbk.dbg import print_stdout, print_stderr, warn, dbgv, dbg
+from bbk.env import init_env, get_env, change_to_env, cleanup_env
+from bbk.properties import get_properties, PropertiesList
+from bbk.version import get_version
+from bbk.witness import WitnessHarness
+from svcomp.helpers import (
+    parse_svcomp_prps,
+    result_to_sv_comp,
+    generate_witness,
+    parse_yml_input,
+)
+
+
+def initialize_env():
+    # we do not use threads, at least not know...
+    setswitchinterval(100)
+
+    init_env(argv[0])
+    change_to_env()
+
+
+def run_workflow(workflow, args):
+    try:
+        return workflow.run()
+    except KeyboardInterrupt:
+        print_stdout("Interrupted, exiting...")
+        workflow.stop()
+        workflow.cleanup()
+    except Exception as e:
+        warn("Caught exception, killing tasks and cleaning up...")
+        print_stderr(str(e))
+        workflow.stop()
+        workflow.kill()
+
+        if not args.save_files:
+            workflow.cleanup()
+        else:
+            dbgv(f"Not cleaning up files on demand, working dir: {get_env().workdir}")
+
+        raise e
+
+    return None, None
+
+
+def get_workflow_module(srcdir, name):
+    workflowsdir = f"{srcdir}/workflows"
+    if isfile(f"{workflowsdir}/{name}.py"):
+        return f"workflows.{name}"
+    return None
+
+
+def get_workflow(programs, args, properties):
+    sys_path.insert(0, get_env().srcdir)
+
+    workflow_cmd = args.workflow.split()
+    wf = None
+    if workflow_cmd[0] == "default":
+        from workflows.default import workflow
+
+        wf = workflow(programs, workflow_cmd[1:], args, properties)
+    elif workflow_cmd[0] == "slowbeast":
+        from workflows.slowbeast import workflow
+
+        wf = workflow(programs, workflow_cmd[1:], args, properties)
+    elif workflow_cmd[0] == "splitting-svcomp24":
+        from workflows.scheduler import workflow_svcomp24
+
+        wf = workflow_svcomp24(programs, workflow_cmd[1:], args, properties)
+
+    elif workflow_cmd[0].startswith("split"):
+        from workflows.splitflows import workflow
+
+        wf = workflow(programs, workflow_cmd[1:], args, properties)
+
+    elif workflow_cmd[0].startswith("cmc"):
+        from workflows.cmc import workflow
+
+        wf = workflow(programs, workflow_cmd[1:], args, properties)
+
+    if not wf:
+        workflow_str = get_workflow_module(get_env().srcdir, workflow_cmd[0])
+        if workflow_str:
+            mod = import_module(workflow_str)
+            wf = mod.workflow(programs, workflow_cmd[1:], args, properties)
+
+    sys_path.pop(0)
+
+    if wf:
+        return wf
+
+    raise RuntimeError(f"Unknown workflow: {args.workflow}")
+
+
+def main():
+    args = parse_arguments()
+    initialize_env()
+    setup_debugging(args)
+
+    print_stdout(f"Bubaak version {get_version()}")
+
+    properties = parse_properties(args)
+    programs = get_source_files(args)
+    workflow = get_workflow(programs, args, properties)
+
+    result, result_task = run_workflow(workflow, args)
+    process_result(result, result_task, properties, args, programs)
+
+    if args.save_files:
+        print_stdout(
+            f"Not cleaning up files as requested, working dir: {get_env().workdir}"
+        )
+    else:
+        cleanup_env()
+
+    print_stdout(
+        f"Runtime: {clock_gettime(CLOCK_REALTIME) - get_env().start_time} seconds"
+    )
+
+
+def parse_properties(args):
+    if args.sv_comp:
+        properties = get_svcomp_properties(args)
+    else:
+        properties = get_properties(args)
+    if not properties:
+        warn("No properties given!")
+        sys_exit(1)
+    print_stdout("Checking the following:", color="white")
+    for prp in properties:
+        print_stdout(f"  - {prp.descr()}", color="white")
+    return properties
+
+
+def get_svcomp_properties(args):
+    # get properties from YAML files
+    # FIXME: each set of properties should be attached to a compilation unit,
+    #  not to the whole program....
+    properties = PropertiesList()
+    for prog in args.prog:
+        yaml_spec = None
+        if prog.endswith(".yml"):
+            yaml_spec = parse_yml_input(prog)
+            if yaml_spec is None:
+                raise RuntimeError(f"Failed parsing {prog}")
+
+        codedirpath = f"{(abspath(dirname(prog)))}"
+        properties.extend(parse_svcomp_prps(args, get_env(), codedirpath, yaml_spec))
+    return properties
+
+
+def iterate_witnesses(results):
+    for res in results:
+        rwitness = res.witness()
+        if rwitness is None:
+            continue
+
+        if not isinstance(rwitness, list):
+            yield rwitness
+            continue
+
+        for witness in rwitness:
+            if isinstance(witness, list):
+                yield from witness.iter()
+            else:
+                yield witness
+
+
+def get_executable_witnesses(results):
+    for witness in iterate_witnesses(results):
+        if isinstance(witness, WitnessHarness):
+            yield witness
+
+
+def gen_harness_and_exec_witness(witness, args, properties, programs):
+    assert isinstance(witness, WitnessHarness), witnes
+
+    ### Harness
+    dbgv(f"Generating harness for '{witness.path}'")
+    harness = args.harness or basename(witness.path)
+    harness_output = harness if harness[0] == "/" else f"{get_env().cwd}/{harness}"
+    if args.harness:
+        copyfile(witness.path, harness_output)
+        print_stdout(f"Generated harness: {harness_output}")
+
+    dbgv(f"Generating an executable witness for '{witness.path}'")
+
+    if not args.exec_witness:
+        return
+
+    ####
+    # Exec witness
+    exe_output = (
+        args.exec_witness
+        if args.exec_witness[0] == "/"
+        else f"{get_env().cwd}/{args.exec_witness}"
+    )
+    ldflags = args.get_D_value("EXEC_WITNESS_LDFLAGS")
+    ldflags = ldflags.split() if ldflags else []
+
+    cflags = args.get_D_value("EXEC_WITNESS_CDFLAGS")
+    cflags = cflags.split() if cflags else []
+
+    memsafety = any(
+        prp.is_valid_deref() or prp.is_valid_free() or prp.is_no_memleak()
+        for prp in properties
+    )
+
+    signed_overflow = any(prp.is_no_signed_overflow() for prp in properties)
+
+    if memsafety and not args.get_D_value("EXEC_WITNESS_NO_SANITIZE"):
+        cflags.append("-fsanitize=address")
+
+    if signed_overflow and not args.get_D_value("EXEC_WITNESS_NO_SANITIZE"):
+        cflags.append("-fsanitize=undefined")
+
+    cc = args.get_D_value("EXEC_WITNESS_CC") or "cc"
+
+    cmd = (
+        [cc, "-g", "-O0", "-o", exe_output, witness.path]
+        + [cu.path for cu in programs]
+        + cflags
+        + ldflags
+    )
+
+    dbg(f"{' '.join(cmd)}")
+    ret = run(cmd)
+    if ret.returncode != 0:
+        warn("Generating the executable witness failed")
+        if not args.harness:
+            copyfile(witness.path, harness_output)
+            print_stdout(f"The harness copied to: {harness_output}")
+
+    print_stdout(f"Generated executable witness: {exe_output}")
+
+
+def process_result(result, task, properties, args, programs):
+    if result is None:
+        if args.sv_comp:
+            print_stdout(("----------------"))
+            print_stdout("SV-COMP verdict: unknown", color="white")
+        print_stderr("ERROR: got no result", color="red")
+        return
+    if result.is_new_tasks() or result.is_replace_task():
+        raise RuntimeError(f"ERROR: got non-final result from a workflow: {result}")
+
+    print_stdout(("----------------"))
+    if result.is_error():
+        print_stderr(f"ERROR: {result.output}")
+        return
+
+    if result.is_timeout():
+        print_stderr(f"RESULT: timeout ({result.output})")
+        if args.sv_comp:
+            print_stdout("SV-COMP verdict: unknown(timeout)", color="white")
+        return
+
+    # the tool is either stored in `result` (if it was a subtask) or it is the `task` itself
+    tool = result.task
+    if tool is None:
+        tool = task
+
+    assert tool, (result, task)
+    assert result.is_done(), result
+    results = result.output
+    for res in results:
+        res.describe()
+
+    if args.sv_comp:
+        print_stdout(("----------------"))
+        if len(results) == 0:
+            print_stdout("SV-COMP verdict: unknown(no results)", color="white")
+            return
+        if len(results) != 1:
+            if (
+                all((r.is_correct() for r in results))
+                or all(
+                    (r.is_incorrect() and r.prp() == results[0].prp() for r in results)
+                )
+                or all((r.is_incorrect() and r.prp().is_memsafety() for r in results))
+            ):
+                dbgv("Multiple violations of the same (meta)property")
+            else:
+                print_stdout(
+                    "SV-COMP verdict: unknown(multiple results)", color="white"
+                )
+                return
+
+        svcomp_result = result_to_sv_comp(results, properties)
+        print_stdout(f"SV-COMP verdict: {svcomp_result}", color="white")
+        if svcomp_result.startswith("true") or svcomp_result.startswith("false"):
+            print_stdout(f"Generating witness: {args.sv_comp_witness}")
+            generate_witness(results, args)
+
+        if args.exec_witness or args.harness:
+            for witness in get_executable_witnesses(results):
+                gen_harness_and_exec_witness(witness, args, properties, programs)
+
+
+if __name__ == "__main__":
+    main()

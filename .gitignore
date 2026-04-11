@@ -1,0 +1,15 @@
+# Ignoring individual verifier codes. We shall
+# make no changes to their source code. However,
+# since the major task involves knowing the kind
+# of benchmarks they excel at, we shall consider
+# them grey boxes.
+
+cpachecker/
+
+klee/
+LICENSE.klee.txt
+
+slowbeast/
+LICENSE.slowbeast.txt
+
+svcomptools/

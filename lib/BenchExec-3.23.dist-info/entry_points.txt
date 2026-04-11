@@ -1,0 +1,5 @@
+[console_scripts]
+benchexec = benchexec.benchexec:main
+containerexec = benchexec.containerexecutor:main
+runexec = benchexec.runexecutor:main
+table-generator = benchexec.tablegenerator:main
