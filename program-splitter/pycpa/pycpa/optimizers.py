@@ -42,6 +42,9 @@ class ExpressionSimplifier:
                  ">": "gt", ">=": "gte",
                  }
     
+    def __init__(self, env=None):
+        self.env = env or {}
+    
     def value(self, literal):
         try:
             return int(literal)
@@ -55,7 +58,11 @@ class ExpressionSimplifier:
         return expression.text.decode("utf-8")
     
     def simplify_identifier(self, expression):
-        return expression.text.decode("utf-8")
+        name = expression.text.decode("utf-8")
+        # If we know the constant value, substitute it!
+        if name in self.env:
+            return str(self.env[name])
+        return name
     
     def simplify_parenthesized_expression(self, expression):
         return self.simplify(expression.children[1])
@@ -115,14 +122,12 @@ class ExpressionSimplifier:
         return getattr(self, f"simplify_{expression.type}", self.identify)(expression)
 
 
-def simplify(expression):
-    return ExpressionSimplifier().simplify(expression)
+# Update the helper functions to accept the environment
+def simplify(expression, env=None):
+    return ExpressionSimplifier(env).simplify(expression)
 
+def is_trivial_true(condition_root, env=None):
+    return simplify(condition_root, env) == "1"
 
-def is_trivial_true(condition_root):
-    #print(simplify(condition_root))
-    return simplify(condition_root) == "1"
-
-
-def is_trivial_false(condition_root):
-    return simplify(condition_root) == "0"
+def is_trivial_false(condition_root, env=None):
+    return simplify(condition_root, env) == "0"

@@ -158,6 +158,15 @@ class BranchingExpansionNode(ExpansionNode):
                 then_branch, else_branch = successors[0], None
             elif is_trivial_false(self.condition()):
                 then_branch, else_branch = None, successors[0]
+            else:
+                # FALLBACK: The condition was optimized away by local constant propagation in the CFG,
+                # so it doesn't evaluate trivially here without the environment.
+                # We can determine which branch survived by checking its AST node directly.
+                consequence = self.cfg_node.ast_node.child_by_field_name("consequence")
+                if successors[0].parent_block.ast_node != consequence:
+                    then_branch, else_branch = successors[0], None
+                else:
+                    then_branch, else_branch = None, successors[0]
         else:
             then_branch, else_branch = successors[0], successors[1]
 

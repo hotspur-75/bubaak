@@ -999,10 +999,125 @@ def declaration_or_call_statement(graph, ast_node, **kwargs):
 
 # if-return and if-abort are directly handled as assumes
 
+def build_local_env(ast_node):
+    env = {}
+    curr = ast_node.prev_named_sibling
+    parent = ast_node.parent
+
+    while parent is not None:
+        while curr is not None:
+            # Stop if we hit unpredictable control flow
+            if curr.type in ["while_statement", "for_statement", "if_statement", "do_statement", "switch_statement", "labeled_statement"]:
+                return {k: v for k, v in env.items() if v is not None}
+            
+            if curr.type == "expression_statement":
+                expr = curr.children[0]
+                if expr.type == "call_expression":
+                    return {k: v for k, v in env.items() if v is not None} # Stop on function call
+                
+                if expr.type == "assignment_expression":
+                    left = expr.children[0]
+                    right = expr.children[-1]
+                    if left.type == "identifier":
+                        name = left.text.decode('utf-8')
+                        if name not in env:
+                            if right.type == "number_literal":
+                                env[name] = int(right.text.decode('utf-8'))
+                            else:
+                                env[name] = None # Poison unknown values so earlier literals don't override
+                                
+            elif curr.type == "declaration":
+                if len(curr.children) == 3 and curr.children[1].type == "init_declarator":
+                    init_declarator = curr.children[1]
+                    left = init_declarator.children[0]
+                    right = init_declarator.children[-1]
+                    if left.type == "identifier":
+                        name = left.text.decode('utf-8')
+                        if name not in env:
+                            if right.type == "number_literal":
+                                env[name] = int(right.text.decode('utf-8'))
+                            else:
+                                env[name] = None
+
+            curr = curr.prev_named_sibling # Step backwards
+        
+        # Move up to the parent block's previous sibling
+        if parent.type == "compound_statement":
+            curr = parent.prev_named_sibling
+            parent = parent.parent
+        else:
+            break
+
+    return {k: v for k, v in env.items() if v is not None}
+
+class TrivialEntryNode(Node):
+    def is_silent(self): 
+        return True
+        
+    def _successors(self):
+        # Silently forward execution down into the inner block
+        return [self.parent_block.inner_blocks()[0].entry_node()]
+
+    def _predecessors(self):
+        # Returning empty triggers pycpa's native _backtrack_predecessors()
+        # to safely step backward into the outer scope.
+        return []
+
+
+class TrivialExitNode(Node):
+    def is_silent(self): 
+        return True
+        
+    def _successors(self):
+        # Returning empty triggers pycpa's native _backtrack_successors()
+        # to safely step forward into the outer scope.
+        return []
+
+    def _predecessors(self):
+        # Silently point backward up into the inner block
+        return [self.parent_block.inner_blocks()[0].exit_node()]
+
+
+class TrivialBranchBlock(BasicBlock):
+    """
+    A transparent proxy block that safely bridges the CFG using silent nodes
+    to avoid infinite recursion and completely bypass IfBranchNodes.
+    """
+    def __init__(self, graph, ast_node, target_ast=None, **kwargs):
+        super().__init__(graph, ast_node, **kwargs)
+        self.target_ast = target_ast
+
+    @cached
+    def inner_blocks(self):
+        if self.target_ast is None:
+            return [EmptyBlock(self.graph, scope=self.scope, parent=self)]
+        return [self.graph.attach(self.target_ast, scope=self.scope, parent=self)]
+
+    @cached
+    def entry_node(self):
+        return TrivialEntryNode(self)
+
+    @cached
+    def exit_node(self):
+        return TrivialExitNode(self)
+
 def if_or_assume(graph, ast_node, **kwargs):
     consequence = ast_node.child_by_field_name("consequence")
     alternative = ast_node.child_by_field_name("alternative")
+    condition   = ast_node.child_by_field_name("condition")
     
+    # Generate the local environment cleanly from the AST!
+    env = build_local_env(ast_node)
+
+    # --- UPDATED OPTIMIZATION ---
+    if is_trivial_true(condition, env=env):
+        return TrivialBranchBlock(graph, ast_node, target_ast=consequence, **kwargs)
+        
+    if is_trivial_false(condition, env=env):
+        target = alternative.children[1] if alternative else None
+        return TrivialBranchBlock(graph, ast_node, target_ast=target, **kwargs)
+    # ----------------------------
+        
     if alternative is None:
         if consequence.type == "compound_statement":
             if len(consequence.children) != 3: return IfStatementBlock(graph, ast_node, **kwargs)
@@ -1012,9 +1127,6 @@ def if_or_assume(graph, ast_node, **kwargs):
         if isinstance(preview_block, AbortBlock):
             return AssumeBlock(graph, ast_node, **kwargs)
         elif isinstance(preview_block, ReturnStatementBlock):
-            #preview_successors = preview_block.exit_node().successors()
-            #next_block = preview_successors[0]
-            #if next_block == preview_block.scope.main_function().exit_node():
             preview_ast = preview_block.ast_node
             if len(preview_ast.children) == 1 or preview_ast.children[1].type == "number_literal":
                 return AssumeBlock(graph, ast_node, **kwargs)
