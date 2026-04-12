@@ -13,3 +13,7 @@ slowbeast/
 LICENSE.slowbeast.txt
 
 svcomptools/
+
+# cache files
+
+__pycache__/

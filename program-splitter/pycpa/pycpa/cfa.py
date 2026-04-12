@@ -737,6 +737,8 @@ def to_dot(start_node, intra = False):
             nodes.append(f'N{node.node_id} [label="N{node.node_id}", color="white"]')
         elif node.is_error_node():
             nodes.append(f'N{node.node_id} [label="N{node.node_id}", color="red"]')
+        elif node.is_branching_node(): # <--- ADD THIS
+            nodes.append(f'N{node.node_id} [label="N{node.node_id}{label}", style="filled", fillcolor="lightblue", color="blue"]') # <--- ADD THIS
         else:
             nodes.append(f'N{node.node_id} [label="N{node.node_id}{label}"]')
 

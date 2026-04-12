@@ -1015,8 +1015,8 @@ def if_or_assume(graph, ast_node, **kwargs):
             #preview_successors = preview_block.exit_node().successors()
             #next_block = preview_successors[0]
             #if next_block == preview_block.scope.main_function().exit_node():
-            ast_node = preview_block.ast_node
-            if len(ast_node.children) == 1 or ast_node.children[1].type == "number_literal":
+            preview_ast = preview_block.ast_node
+            if len(preview_ast.children) == 1 or preview_ast.children[1].type == "number_literal":
                 return AssumeBlock(graph, ast_node, **kwargs)
 
     return IfStatementBlock(graph, ast_node, **kwargs)

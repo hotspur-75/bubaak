@@ -13,7 +13,16 @@ follows below.
 
 # Changes
 
-There are no changes yet, except the edit you are looking at.
+Started work on the minor task, and devised scripts to closely observe the working. Two kinds
+of trivial splits have become apparent - splits in internal branches of functions like 
+*__VERIFIER_assert()*, where one split immediately hits an error node and terminates - and cases
+where the splitting is done at a location which can be seen to be trivially true, like the
+first split in *lcm1_unwindbound5.c*, where the branching condition is *(counter++ < 5>)*, despite
+*int counter = 0* just being declared.
+
+The first sort of trivial split can be resolved by a structural check which analyses the complexity 
+of either branch. The second can be resolved with a quick value analysis, as stated by the authors  
+themselves.
 
 # Bubaak
 
