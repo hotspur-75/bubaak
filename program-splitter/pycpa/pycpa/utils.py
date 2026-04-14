@@ -8,11 +8,11 @@ def cached(fn):
         class_name = self.__class__.__name__
         full_name = f"{class_name}_{fn_name}"
 
-        try:
-            cache_dict = self.__geattrbute__(self, "_cache_")
-        except AttributeError:
+        # Safely fetch the cache dictionary, or create it if it doesn't exist
+        cache_dict = getattr(self, "_cache_", None)
+        if cache_dict is None:
             cache_dict = {}
-            self.__setattr__("_cache_", cache_dict)
+            setattr(self, "_cache_", cache_dict)
 
         try:
             return cache_dict[full_name]

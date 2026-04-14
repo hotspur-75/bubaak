@@ -17,3 +17,9 @@ svcomptools/
 # cache files
 
 __pycache__/
+
+# testing files for pycpa
+
+program-splitter/pycpa/*.c
+program-splitter/pycpa/*.png
+program-splitter/pycpa/*.dot

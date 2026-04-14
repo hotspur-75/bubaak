@@ -643,7 +643,52 @@ def _compute_postdominators(cfa_node):
     predecessors = _compute_predecessor_relation(cfa_node)
     start_node   = cfa_node.function_exit()
 
-    assert start_node in predecessors, "Function exit does not seem to be reached"
+    # --- FIX 1: HANDLE UNREACHABLE FUNCTION EXITS ---
+    if start_node not in predecessors:
+        visited = set()
+        rec_stack = set()
+        latches = set()
+        
+        stack = [(cfa_node, False)]
+        while stack:
+            node, is_backtrack = stack.pop()
+            if is_backtrack:
+                rec_stack.remove(node)
+                continue
+            
+            if node in visited: continue
+                
+            visited.add(node)
+            rec_stack.add(node)
+            stack.append((node, True))
+            
+            successors = node.intra().successors()
+            if not successors:
+                latches.add(node)
+            else:
+                for edge in successors:
+                    succ = edge.successor
+                    if succ not in visited:
+                        stack.append((succ, False))
+                    elif succ in rec_stack:
+                        latches.add(node)
+                        
+        predecessors[start_node] = list(latches)
+        for latch in latches:
+            if latch not in predecessors:
+                predecessors[latch] = []
+    # ----------------------------------------------
+
+    # --- FIX 2: BUILD SYMMETRIC SUCCESSORS MAP ---
+    # The algorithm must use a forward-map that perfectly mirrors 
+    # the predecessors map, including our artificial links!
+    successors_map = {}
+    for node, preds in predecessors.items():
+        if node not in successors_map: successors_map[node] = []
+        for p in preds:
+            if p not in successors_map: successors_map[p] = []
+            successors_map[p].append(node)
+    # ---------------------------------------------
 
     idom = {start_node: start_node}
 
@@ -665,15 +710,16 @@ def _compute_postdominators(cfa_node):
         changed = False
         for u in order:
             new_idom = None
-            for succ_edge in u.intra().successors():
-                succ = succ_edge.successor
+            
+            # --- OVERRIDE: Use the symmetric map instead of u.intra().successors()
+            for succ in successors_map.get(u, []):
                 if succ in idom:
                     if new_idom is None:
                         new_idom = succ
                     else:
                         new_idom = intersect(succ, new_idom)
-            
-            if idom.get(u, None) != new_idom:
+
+            if new_idom is not None and idom.get(u) != new_idom:
                 idom[u] = new_idom
                 changed = True
 

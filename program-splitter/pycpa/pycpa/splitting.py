@@ -8,12 +8,29 @@ from .cpa.base import PathAnalysis, TargetAnalysis
 from .cpa.rewrites import LoopUnrollingRewriter, FunctionCloningRewriter, SplittingRewriter, SideEffectRewriter, _replace_all
 from .cpa.rewrites import clean_skip_annotations
 
+from .heuristics import is_structurally_trivial
+
 from .env import GLOBAL_TIMER, global_timeout
 
 def run_splitter(program, cpas = None, split_fn = None, **kwargs):
 
     if isinstance(program, str): program = ControlFlowAutomata(cfg(program))
-    if split_fn is None        : split_fn = lambda state: last_branching_state(state) is not None
+    
+    # --- UPDATED SPLIT CONDITION ---
+    if split_fn is None: 
+        def default_split_fn(state):
+            branch_state = last_branching_state(state)
+            if branch_state is None: 
+                return False
+            
+            # Pure structural check. No is_in_loop bypass!
+            if is_structurally_trivial(branch_state.cfa_node, threshold=0):
+                return False
+            
+            return True
+            
+        split_fn = default_split_fn
+    # -------------------------------
 
     counterexamples = set()
 
@@ -21,6 +38,8 @@ def run_splitter(program, cpas = None, split_fn = None, **kwargs):
                                 (branching_decisions(state) not in counterexamples) and split_fn(state))
 
     analysis = _init_cpas(cpas)
+    
+    # ... rest of the run_splitter logic ...
 
     split_state    = None
     while split_state is None:

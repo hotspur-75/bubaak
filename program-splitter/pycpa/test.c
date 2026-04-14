@@ -19,15 +19,49 @@ void __VERIFIER_assert(int cond) {
     return;
 }
 
+int counter = 0;
 int main() {
-    int z = 10;
-    int y = 15;
-    if (y == 15) {
-        z = 20;
+    unsigned a, b;
+    unsigned x, y, u, v;
+    a = __VERIFIER_nondet_uint();
+    b = __VERIFIER_nondet_uint();
+    assume_abort_if_not(a >= 1);  //infinite loop if remove
+    assume_abort_if_not(b >= 1);
+
+    assume_abort_if_not(a <= 65535);
+    assume_abort_if_not(b <= 65535);
+
+    x = a;
+    y = b;
+    u = b;
+    v = 0;
+
+    while (counter++<5) {
+        __VERIFIER_assert(x*u + y*v == a*b);
+        if (!(x != y))
+            break;
+
+        while (counter++<5) {
+	    __VERIFIER_assert(x*u + y*v == a*b);
+            if (!(x > y))
+                break;
+            x = x - y;
+            v = v + u;
+        }
+
+        while (counter++<5) {
+	    __VERIFIER_assert(x*u + y*v == a*b);
+            if (!(x < y))
+                break;
+            y = y - x;
+            u = u + v;
+        }
     }
-    else {
-        z = 49;
-    }
-    __VERIFIER_assert(z == y);
+
+    __VERIFIER_assert(u*y + v*y == a*b);
+    __VERIFIER_assert(x == y);
+
+    //x == gcd(a,b)
+    //u + v == lcm(a,b)
     return 0;
 }

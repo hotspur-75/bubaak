@@ -29,6 +29,10 @@ false, replacing it with the tautological branch. I applied this to the author's
 tautologies and fallacies in if-statement conditionals, and extended it from a simple mathematical
 check to also utilising local variables. I will try extending this as much as I can safely.
 
+Successfully implemented a split eliminator which discounts possible split locations with one or
+more branches terminating within some *threshold* nodes. The definition may yet need to be tweaked,
+but it seems to be working fine for now.
+
 # Bubaak
 
 Bubaak is a set of scripts that run program verifiers in a dynamically changing
