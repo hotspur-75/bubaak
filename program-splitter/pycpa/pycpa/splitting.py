@@ -24,7 +24,7 @@ def run_splitter(program, cpas = None, split_fn = None, **kwargs):
                 return False
             
             # Pure structural check. No is_in_loop bypass!
-            if is_structurally_trivial(branch_state.cfa_node, threshold=-1):
+            if is_structurally_trivial(branch_state.cfa_node, threshold=1):
                 return False
             
             return True

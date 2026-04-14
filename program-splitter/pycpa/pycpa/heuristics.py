@@ -32,23 +32,36 @@ def is_structurally_trivial(cfa_node, threshold=3):
             is_exit = "Exit" in curr.__class__.__name__
             is_join = curr in peer_reachable
             
-            if is_dead_end or is_exit or is_join:
-                return depth
-                
-            if depth >= threshold:
-                continue
-                
-            for edge in curr.successors():
-                if edge.successor not in visited:
-                    visited.add(edge.successor)
-                    queue.append((edge.successor, depth + 1))
+            if is_dead_end: return depth, "DEADEND"
+            if is_exit: return depth, "EXIT"
+            if is_join:
+                # Loop-Join Illusion Immunity
+                c_cfg = getattr(curr, 'cfg_node', None)
+                c_block = getattr(c_cfg, 'parent_block', None) if c_cfg else None
+                if c_block:
+                    b_name = c_block.__class__.__name__
+                    if "Loop" in b_name or "For" in b_name or "While" in b_name:
+                        return float('inf'), "LOOP"
+                return depth, "JOIN"
         
-        return float('inf')
+        # (End of the while queue loop)
+        return float('inf'), "LONG"
 
-    left_len = path_length_to_target(successors[0], successors[1])
-    right_len = path_length_to_target(successors[1], successors[0])
+    left_len, left_type = path_length_to_target(successors[0], successors[1])
+    right_len, right_type = path_length_to_target(successors[1], successors[0])
 
-    is_trivial = left_len <= threshold or right_len <= threshold
+    # 1. Early-Exit Rule: If either path quickly terminates, it's trivial sanitization.
+    if (left_type in ["DEADEND", "EXIT"] and left_len <= threshold) or \
+       (right_type in ["DEADEND", "EXIT"] and right_len <= threshold):
+        is_trivial = True
+
+    # 2. Bypass Rule: If it's a merge, ONLY mark trivial if BOTH paths are short (Symmetric).
+    # This saves "Heavy/Light" Asymmetric splits like in `terminator`.
+    elif left_type == "JOIN" and right_type == "JOIN":
+        is_trivial = left_len <= threshold and right_len <= threshold
+        
+    else:
+        is_trivial = False
     
     # Save to cache before returning
     _STRUCTURAL_CACHE[cfa_node] = is_trivial
