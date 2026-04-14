@@ -1,4 +1,3 @@
-# Add this near the top of splitting.py
 _STRUCTURAL_CACHE = {}
 
 def is_structurally_trivial(cfa_node, threshold=3):

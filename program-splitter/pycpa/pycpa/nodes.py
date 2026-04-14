@@ -1001,54 +1001,79 @@ def declaration_or_call_statement(graph, ast_node, **kwargs):
 
 def build_local_env(ast_node):
     env = {}
-    curr = ast_node.prev_named_sibling
-    parent = ast_node.parent
+    if ast_node is None: return env
 
-    while parent is not None:
-        while curr is not None:
-            # Stop if we hit unpredictable control flow
-            if curr.type in ["while_statement", "for_statement", "if_statement", "do_statement", "switch_statement", "labeled_statement"]:
-                return {k: v for k, v in env.items() if v is not None}
-            
-            if curr.type == "expression_statement":
-                expr = curr.children[0]
-                if expr.type == "call_expression":
-                    return {k: v for k, v in env.items() if v is not None} # Stop on function call
-                
-                if expr.type == "assignment_expression":
-                    left = expr.children[0]
-                    right = expr.children[-1]
-                    if left.type == "identifier":
-                        name = left.text.decode('utf-8')
-                        if name not in env:
-                            if right.type == "number_literal":
-                                env[name] = int(right.text.decode('utf-8'))
-                            else:
-                                env[name] = None # Poison unknown values so earlier literals don't override
-                                
-            elif curr.type == "declaration":
-                if len(curr.children) == 3 and curr.children[1].type == "init_declarator":
-                    init_declarator = curr.children[1]
-                    left = init_declarator.children[0]
-                    right = init_declarator.children[-1]
-                    if left.type == "identifier":
-                        name = left.text.decode('utf-8')
-                        if name not in env:
-                            if right.type == "number_literal":
-                                env[name] = int(right.text.decode('utf-8'))
-                            else:
-                                env[name] = None
+    # Safely resolve the parent block containing the AST nodes
+    parent_block = getattr(ast_node, 'parent_block', None)
+    if parent_block is None:
+        curr = getattr(ast_node, 'parent', None)
+        while curr and not hasattr(curr, 'block_items'):
+            curr = getattr(curr, 'parent', None)
+        parent_block = curr
 
-            curr = curr.prev_named_sibling # Step backwards
+    if parent_block is None or not hasattr(parent_block, 'block_items'): 
+        return env
+
+    block_items = parent_block.block_items
+    if block_items is None: return env
+
+    try:
+        current_index = block_items.index(ast_node)
+    except ValueError:
+        return env
+
+    siblings_before_current = block_items[:current_index]
+
+    for sibling in reversed(siblings_before_current):
+        sibling_type = sibling.__class__.__name__
+
+        # --- SAFETY BARRIER 1: Loop & Label Bounding ---
+        # Never look past a loop header or label. Variables might be modified 
+        # by back-edges, making linear static look-back unsound!
+        if any(k in sibling_type for k in ["Loop", "For", "While", "DoWhile", "Label"]):
+            break 
         
-        # Move up to the parent block's previous sibling
-        if parent.type == "compound_statement":
-            curr = parent.prev_named_sibling
-            parent = parent.parent
-        else:
-            break
+        if "Decl" in sibling_type or "Assignment" in sibling_type:
+            try:
+                if "Decl" in sibling_type:
+                    name = getattr(sibling, 'name', None)
+                    right = getattr(sibling, 'init', None)
+                else:
+                    name = sibling.lvalue.name if hasattr(sibling.lvalue, 'name') else sibling.lvalue.text.decode('utf-8')
+                    right = getattr(sibling, 'rvalue', None)
 
-    return {k: v for k, v in env.items() if v is not None}
+                if right is None or name is None:
+                    continue
+
+                val_str = right.text.decode('utf-8').strip()
+
+                # --- SAFETY BARRIER 2: The Poison Pill ---
+                # If the assignment is a function call (especially nondet),
+                # it is non-deterministic. Poison the variable so it isn't evaluated.
+                if "()" in val_str or "nondet" in val_str:
+                    env[name] = "UNKNOWN"
+                    continue
+
+                # If the variable was already poisoned by a closer assignment, skip it
+                if env.get(name) == "UNKNOWN":
+                    continue
+
+                # --- SAFETY BARRIER 3: Type-Agnostic Parsing ---
+                try:
+                    # Try to parse as a standard base-10 or hex integer first
+                    if val_str.startswith(("0x", "0X")):
+                        env[name] = int(val_str, 16)
+                    else:
+                        env[name] = int(val_str)
+                except ValueError:
+                    # If it's a float like '16.f', '3.14', or complex math,
+                    # just save the raw text. safe_math_eval handles strings safely!
+                    env[name] = val_str
+
+            except Exception:
+                continue
+
+    return env
 
 class TrivialEntryNode(Node):
     def is_silent(self): 
