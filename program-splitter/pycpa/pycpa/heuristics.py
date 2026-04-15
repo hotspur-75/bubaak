@@ -1,50 +1,31 @@
 _STRUCTURAL_CACHE = {}
 
 def is_structurally_trivial(cfa_node, threshold=3):
-    # Check cache first
     if cfa_node in _STRUCTURAL_CACHE:
         return _STRUCTURAL_CACHE[cfa_node]
 
     edges = cfa_node.successors()
     if len(edges) < 2:
         return False
-        
-    # --- CONTEXT AWARENESS 1: Loop Shield ---
-    def is_in_loop(node):
-        if hasattr(node, 'loop_info'):
-            try:
-                if node.loop_info() is not None: return True
-            except: pass
-            
-        c_cfg = getattr(node, 'cfg_node', None)
-        block = getattr(c_cfg, 'parent_block', None) if c_cfg else None
-        while block:
-            name = block.__class__.__name__
-            if "Loop" in name or "For" in name or "While" in name or "Do" in name:
-                return True
-            block = getattr(block, 'parent_block', None)
-        return False
 
-    in_loop_context = is_in_loop(cfa_node)
-    successors = [edge.successor for edge in edges]
-        
-    def analyze_paths(start_node, peer_start_node):
+    def path_length_to_target(start_node, peer_start_node):
+        # THE IMPENETRABLE WALL: cfa_node is added to visited immediately.
+        # This prevents loops from being mathematically mistaken for diamonds.
         peer_reachable = {peer_start_node}
         peer_queue = [(peer_start_node, 0)]
+        peer_visited = {peer_start_node, cfa_node} 
+
         while peer_queue:
             curr, depth = peer_queue.pop(0)
             if depth > threshold + 2: continue 
             for edge in curr.successors():
-                if edge.successor not in peer_reachable:
+                if edge.successor not in peer_visited:
+                    peer_visited.add(edge.successor)
                     peer_reachable.add(edge.successor)
                     peer_queue.append((edge.successor, depth + 1))
 
         queue = [(start_node, 0)]
-        visited = {start_node}
-        
-        # --- CONTEXT AWARENESS 2: Semantic Scanning ---
-        has_complex_math = False
-        has_func_call = False
+        visited = {start_node, cfa_node} 
         
         while queue:
             curr, depth = queue.pop(0)
@@ -53,52 +34,33 @@ def is_structurally_trivial(cfa_node, threshold=3):
             is_exit = "Exit" in curr.__class__.__name__
             is_join = curr in peer_reachable
             
-            if is_dead_end: return depth, "DEADEND", has_complex_math, has_func_call
-            if is_exit: return depth, "EXIT", has_complex_math, has_func_call
-            if is_join: return depth, "JOIN", has_complex_math, has_func_call
+            if is_dead_end: return depth, "DEADEND"
+            if is_exit: return depth, "EXIT"
+            if is_join: return depth, "JOIN"
             
             if depth < threshold:
                 for edge in curr.successors():
-                    # Scan the edge for semantic complexity
-                    edge_code = str(getattr(edge, 'statement', edge)).lower()
-                    if any(op in edge_code for op in ['float', 'double', '/', '%', '<<', '>>']):
-                        has_complex_math = True
-                    if '(' in edge_code and ')' in edge_code and not any(kw in edge_code for kw in ['if', 'while', 'for', 'assert']):
-                        has_func_call = True
-
                     if edge.successor not in visited:
                         visited.add(edge.successor)
                         queue.append((edge.successor, depth + 1))
         
-        return float('inf'), "LONG", has_complex_math, has_func_call
+        return float('inf'), "LONG"
 
-    l_len, l_type, l_math, l_func = analyze_paths(successors[0], successors[1])
-    r_len, r_type, r_math, r_func = analyze_paths(successors[1], successors[0])
+    successors = [edge.successor for edge in edges]
+    left_len, left_type = path_length_to_target(successors[0], successors[1])
+    right_len, right_type = path_length_to_target(successors[1], successors[0])
 
-    # --- THE SITUATIONAL DECISION MATRIX ---
-
-    # 1. EARLY PRUNING: Isolate bug-states and fast-paths.
-    if l_type in ["DEADEND", "EXIT"] or r_type in ["DEADEND", "EXIT"]:
+    # 1. ERROR & EXIT ATTRACTION (Highest Priority - Solves Floats/Traps)
+    if left_type in ["DEADEND", "EXIT"] or right_type in ["DEADEND", "EXIT"]:
         is_trivial = False
 
-    # 2. SYMMETRIC DIAMONDS (Context Dependent)
-    elif l_type == "JOIN" and r_type == "JOIN":
-        if in_loop_context:
-            # Inside a loop: Splitting causes 2^N explosion. BYPASS.
-            is_trivial = (l_len <= threshold) and (r_len <= threshold)
-        else:
-            # Linear Code: Check the semantic context
-            if l_math or r_math or l_func or r_func:
-                # SMT Theory overload or Asymmetric Function -> FORCE SPLIT
-                is_trivial = False
-            else:
-                # Pure simple data assignment (The 'ofuf' pattern) -> BYPASS
-                is_trivial = (l_len <= threshold) and (r_len <= threshold)
-            
-    # 3. DEFAULT: Complex Branches
+    # 2. TRUE SYMMETRIC DIAMONDS (Solves Combinatorial Arrays & FSMs)
+    elif left_type == "JOIN" and right_type == "JOIN":
+        is_trivial = (left_len <= threshold) and (right_len <= threshold)
+
+    # 3. LOOPS & ASYMMETRIC COMPLEXITY (Solves gauss_sum & combinations)
     else:
         is_trivial = False
     
-    # Save to cache before returning
     _STRUCTURAL_CACHE[cfa_node] = is_trivial
     return is_trivial
