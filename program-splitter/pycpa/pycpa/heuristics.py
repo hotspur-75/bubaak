@@ -5,6 +5,12 @@ def is_structurally_trivial(cfa_node, threshold=3):
     if cfa_node in _STRUCTURAL_CACHE:
         return _STRUCTURAL_CACHE[cfa_node]
     
+    # --- FIX 1: LOOP CONDITION IMMUNITY ---
+    # Never bypass splits on loop evaluation headers. Splitting here is required to unroll loops!
+    if "Loop" in cfa_node.__class__.__name__ or "For" in cfa_node.__class__.__name__:
+        _STRUCTURAL_CACHE[cfa_node] = False
+        return False
+        
     edges = cfa_node.successors()
     if len(edges) < 2:
         return False
@@ -32,6 +38,7 @@ def is_structurally_trivial(cfa_node, threshold=3):
             is_exit = "Exit" in curr.__class__.__name__
             is_join = curr in peer_reachable
             
+            # Note: We now keep DEADEND and EXIT strictly separate
             if is_dead_end: return depth, "DEADEND"
             if is_exit: return depth, "EXIT"
             if is_join:
@@ -43,20 +50,27 @@ def is_structurally_trivial(cfa_node, threshold=3):
                     if "Loop" in b_name or "For" in b_name or "While" in b_name:
                         return float('inf'), "LOOP"
                 return depth, "JOIN"
+            
+            if depth < threshold:
+                for edge in curr.successors():
+                    if edge.successor not in visited:
+                        visited.add(edge.successor)
+                        queue.append((edge.successor, depth + 1))
         
-        # (End of the while queue loop)
         return float('inf'), "LONG"
 
     left_len, left_type = path_length_to_target(successors[0], successors[1])
     right_len, right_type = path_length_to_target(successors[1], successors[0])
 
-    # 1. Early-Exit Rule: If either path quickly terminates, it's trivial sanitization.
-    if (left_type in ["DEADEND", "EXIT"] and left_len <= threshold) or \
-       (right_type in ["DEADEND", "EXIT"] and right_len <= threshold):
+    # --- FIX 2: STRICT ERROR-ONLY EARLY EXITS ---
+    # 1. Early-Exit Rule: Only bypass if it hits a DEADEND (Error/Sanitization). 
+    # Do NOT bypass normal EXITS (Returns), because splitting returns is highly beneficial.
+    if (left_type == "DEADEND" and left_len <= threshold) or \
+       (right_type == "DEADEND" and right_len <= threshold):
         is_trivial = True
 
     # 2. Bypass Rule: If it's a merge, ONLY mark trivial if BOTH paths are short (Symmetric).
-    # This saves "Heavy/Light" Asymmetric splits like in `terminator`.
+    # This saves "Heavy/Light" Asymmetric splits like in `terminator` while catching simple `if/else` diamonds.
     elif left_type == "JOIN" and right_type == "JOIN":
         is_trivial = left_len <= threshold and right_len <= threshold
         
