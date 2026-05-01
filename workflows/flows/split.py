@@ -556,6 +556,7 @@ def _cpa_merge_fn(original_code, left_split, right_split, timeout = 10):
         )
     except ValueError as e:
         print_stderr(str(e))
+        import traceback; traceback.print_exc()
         dbg("Cannot merge programs. Run naive merger instead", color = "red")
         return _naive_merge_fn(original_code, left_split, right_split)
     

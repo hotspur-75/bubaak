@@ -41,3 +41,8 @@ from .workstealing import (
     WorkStealingComposition,
     WorkStealingAlgorithm
 )
+
+from .predictive_split import (
+    PeriodicMergeTask,
+    heuristic_predictor,
+)
