@@ -141,7 +141,7 @@ def heuristic_predictor(inputfile, verifiers: list, depth: int, lineage_state: d
         
         if not metrics or metrics.get('status') == 'ERROR':
             dbg("[PREDICTOR] Parsing failed (likely sequentialized benchmark). Using safe fallback.", color="red")
-            return [v_map['se'], v_map['pa'], 'split', v_map['ki'], v_map['bmc']]
+            return [v_map['se'], v_map['bmc'], v_map['pa'], v_map['ki'], 'split']
 
         # 3. Convert dict to exactly the format expected by scikit-learn
         import pandas as pd
@@ -197,12 +197,19 @@ def heuristic_predictor(inputfile, verifiers: list, depth: int, lineage_state: d
         sorted_verifiers = sorted(adjusted_probs.items(), key=lambda item: item[1], reverse=True)
         max_confidence = sorted_verifiers[0][1] if sorted_verifiers else 0.0
         
-        # Threshold drops as depth increases, anchored to the best available model
-        # Depth decay reduces the threshold by 10% per depth level
-        depth_decay = max(0.5, 1.0 - (0.10 * depth))
-        dynamic_threshold = max(T_FLOOR, max_confidence * 0.80 * depth_decay)
-        
-        dbg(f"  -> Dynamic Split Threshold set to: {dynamic_threshold:.2f}", color="cyan")
+        # --- NEW: Low Confidence Failsafe ---
+        if max_confidence < 0.15:
+            dbg("  -> ALL verifiers below 0.15 confidence. Abolishing threshold to try all.", color="yellow")
+            dynamic_threshold = 0.0  # Forcing threshold to 0 ensures all verifiers run before splitting
+        else:
+            # Threshold drops as depth increases, anchored to the best available model
+            # Depth decay reduces the threshold by 10% per depth level
+            depth_decay = max(0.5, 1.0 - (0.10 * depth))
+            
+            # Clamp the maximum possible threshold to 0.5
+            dynamic_threshold = min(0.5, max(T_FLOOR, max_confidence * 0.80 * depth_decay))
+            
+            dbg(f"  -> Dynamic Split Threshold set to: {dynamic_threshold:.2f}", color="cyan")
 
         # 7. Build optimal orchestration sequence
         sequence = []
@@ -283,6 +290,8 @@ class SequentialCheckTask(ContinuationTask):
 
 # --- 3. PREDICTIVE POLICY ENFORCER ---
 
+# --- 3. PREDICTIVE POLICY ENFORCER (WITH CYCLE-THRASHING PROTECTION) ---
+
 class PredictiveCheckTask(ContinuationTask):
     def __init__(self, verifiers, predictor, inputfile, depth=0, split_parent=None, lineage_state=None):
         self._verifiers = verifiers
@@ -293,18 +302,35 @@ class PredictiveCheckTask(ContinuationTask):
         
         # 1. Initialize or inherit the lineage state
         self.lineage_state = lineage_state or {'punish': [], 'reward': []}
-
-        # 2. Ask predictor for the policy sequence, passing the state!
-        actions = self._predictor(self._inputfile, self._verifiers, self._depth, self.lineage_state)
         
-        if 'split' not in actions:
-            raise ValueError(f"[FATAL] Predictor did not return a 'split' token...")
+        # --- NEW: CYCLE THRASHING DETECTION ---
+        self.MAX_DEPTH_LIMIT = 15
+        self.is_terminal_fallback = False
+        
+        from bbk.dbg import dbg
+        
+        if self._depth >= self.MAX_DEPTH_LIMIT:
+            dbg(f"[CYCLE THRASHING DETECTED] Depth {self._depth} reached for {self._inputfile.path}. Triggering Fallback.", color="red")
+            self.is_terminal_fallback = True
             
-        split_index = actions.index('split')
-        self.verifiers_to_run = actions[:split_index] # Save this to know who failed
-        
-        str_names = [v.__class__.__name__ for v in self.verifiers_to_run]
-        dbg(f"[{self._inputfile.path} | Depth {self._depth}] Execution Plan: {' -> '.join(str_names)} -> SPLIT", color="magenta")
+            # Hardcoded Fallback Sequence: SE -> KI -> PA -> BMC
+            # Mapped to the strict Bubaak initialization order: [PA, KI, SE, BMC]
+            self.verifiers_to_run = [self._verifiers[2], self._verifiers[1], self._verifiers[0], self._verifiers[3]]
+            str_names = [v.__class__.__name__ for v in self.verifiers_to_run]
+            dbg(f"[{self._inputfile.path} | Depth {self._depth}] Fallback Execution Plan: {' -> '.join(str_names)} -> TERMINAL EXIT", color="magenta")
+            
+        else:
+            # 2. Normal AI-driven flow: Ask predictor for the policy sequence
+            actions = self._predictor(self._inputfile, self._verifiers, self._depth, self.lineage_state)
+            
+            if 'split' not in actions:
+                raise ValueError(f"[FATAL] Predictor did not return a 'split' token...")
+                
+            split_index = actions.index('split')
+            self.verifiers_to_run = actions[:split_index] # Save this to know who failed
+            
+            str_names = [v.__class__.__name__ for v in self.verifiers_to_run]
+            dbg(f"[{self._inputfile.path} | Depth {self._depth}] Execution Plan: {' -> '.join(str_names)} -> SPLIT", color="magenta")
 
         super().__init__(
             SequentialCheckTask(self.verifiers_to_run, self._inputfile, self._depth, split_parent=split_parent), 
@@ -318,8 +344,19 @@ class PredictiveCheckTask(ContinuationTask):
         # If the result is "DONE" but not conclusive, the sequential verifiers failed.
         if result.is_done() and not task_result_is_conclusive(result):
             
+            # --- NEW: TERMINAL EXIT FOR FALLBACK ---
+            if self.is_terminal_fallback:
+                from bbk.dbg import print_stdout
+                from bbk.verdict import Verdict
+                print_stdout(f"[TERMINAL EXIT] Hail Mary fallback failed for {self._inputfile.path}. Moving to residual pool to prevent infinite loops.", color="yellow")
+                
+                # Wrap it in a Fake Verdict so Bubaak's scheduler catches it and bypasses the Splitter
+                fallback_prp = self._verifiers[0].property
+                fake_result = TaskResult("DONE", output=[Verdict(Verdict.UNKNOWN, prp=fallback_prp)], task=result.task)
+                return fake_result
+            # ---------------------------------------
+
             # Map the instantiated verifier objects back to their exact predictor keys
-            # based on the strict Bubaak initialization order: [PA, KI, SE, BMC]
             v_map_reverse = {
                 self._verifiers[0]: 'pa',
                 self._verifiers[1]: 'ki',

@@ -21,6 +21,39 @@ from pycpa.env import global_timeout
 from pretransforms import support_extensions
 from utils import main
 
+import re
+
+def sanitize_for_merger(code):
+    """
+    Strips GNU C extensions and complex macros that crash the pycpa AST parser 
+    during the merge phase.
+    """
+    if not isinstance(code, str):
+        return code
+        
+    # 1. Strip attributes safely (handles nested parentheses)
+    code = re.sub(r'__attribute__\s*\(\([^()]*(\([^()]*\)[^()]*)*\)\)', '', code)
+    
+    # 2. Fix reach_error() statement expression crashes
+    code = re.sub(
+        r'void\s+reach_error\(\)\s*\{.*?__PRETTY_FUNCTION__.*?\)\);\s*\}', 
+        'void reach_error() { abort(); }', 
+        code, 
+        flags=re.DOTALL
+    )
+    
+    # 3. Strip remaining standard GNU extensions
+    code = re.sub(r'\b__extension__\b', '', code)
+    code = re.sub(r'\b__inline__\b', 'inline', code)
+    code = re.sub(r'\b__inline\b', 'inline', code)
+    code = re.sub(r'\b__const\b', 'const', code)
+    code = re.sub(r'\b__restrict\b', 'restrict', code)
+    code = re.sub(r'\b__restrict__\b', 'restrict', code)
+    code = re.sub(r'\b__asm__\b.*?(\(.*?\))', '', code, flags=re.DOTALL)
+    code = re.sub(r'\b__int128\b', 'long long', code)
+    code = re.sub(r'\b__PRETTY_FUNCTION__\b', '""', code)
+    
+    return code
 
 def program_merger(
         left_split : str,
@@ -73,6 +106,9 @@ def merge_programs(left_program, right_program, timeout = 60):
 
     with global_timeout(timeout):
         try:
+            left_program = sanitize_for_merger(left_program)
+            right_program = sanitize_for_merger(right_program)
+            
             return _merge_program_fn(left_program, right_program)
         except TimeoutError as e:
             raise ValueError(str(e))

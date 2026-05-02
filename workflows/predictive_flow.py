@@ -12,14 +12,14 @@ from workflows.flows.verifiers import (
 # ============================================================================
 # GLOBAL CONFIGURATIONS
 # ============================================================================
-PERIODIC_MERGE_TIMEOUT = 1000
+PERIODIC_MERGE_TIMEOUT = 300
 MAX_SPLIT_DEPTH = 10  
 
 INDIVIDUAL_TIMEOUTS = {
-    "CPAPredicateAnalysis": 40,
-    "CPAkInduction": 40,  # 100s prevents CPA's early heuristic drop!
-    "KLEEVerifier": 20,
-    "SVCOMPVerifier": 40
+    "PA": 30,
+    "KI": 150,
+    "SE": 30,
+    "BMC": 80
 }
 # ============================================================================
 
@@ -30,13 +30,13 @@ def workflow(programs, workflow_args, args, properties):
     # Bubaak's OS-killer will now correctly monitor the internal ProcessTasks!
     verifiers = [
         #PA
-        CPAPredicateAnalysis(args, target_property, timeout=INDIVIDUAL_TIMEOUTS["CPAPredicateAnalysis"]),
+        CPAPredicateAnalysis(args, target_property, timeout=INDIVIDUAL_TIMEOUTS["PA"]),
         #KI
-        CPAkInduction(args, target_property, timeout=INDIVIDUAL_TIMEOUTS["CPAkInduction"]),
+        SVCOMPVerifier("esbmc-kind", args, target_property, timeout=INDIVIDUAL_TIMEOUTS["KI"]),
         #SE
-        KLEEVerifier(args, target_property, timeout=INDIVIDUAL_TIMEOUTS["KLEEVerifier"]),
+        KLEEVerifier(args, target_property, timeout=INDIVIDUAL_TIMEOUTS["SE"]),
         #BMC
-        SVCOMPVerifier("esbmc-incr", args, target_property, timeout=INDIVIDUAL_TIMEOUTS["SVCOMPVerifier"]),
+        SVCOMPVerifier("esbmc-incr", args, target_property, timeout=INDIVIDUAL_TIMEOUTS["BMC"]),
     ]
     
     main_task = PeriodicMergeTask(

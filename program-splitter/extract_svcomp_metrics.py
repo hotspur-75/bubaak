@@ -229,14 +229,12 @@ import subprocess
 import re
 
 def preprocess_c_code(filepath):
-    """
-    Attempts GCC preprocessing. If GCC fails (due to missing local headers),
-    it falls back to regex-sanitization and forcibly injects dummy typedefs 
-    so pycparser can successfully build the AST.
-    """
     try:
+        # 1. To prevent glibc expansion crashes on .c files, we MUST mock the headers.
+        # However, for SV-COMP, it's safer to just let GCC expand local macros but ignore system headers.
+        # We add '-nostdinc' so it doesn't pull in host glibc headers for .c files.
         result = subprocess.run(
-            ['gcc', '-E', '-P', '-xc', filepath],
+            ['gcc', '-E', '-P', '-xc', '-nostdinc', filepath],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
@@ -244,38 +242,15 @@ def preprocess_c_code(filepath):
         )
         code = result.stdout
         
-        # Strip GNU extensions left behind by GCC
-        code = re.sub(r'__attribute__\s*\(\(.*?\)\)', '', code, flags=re.DOTALL)
-        code = re.sub(r'\b__extension__\b', '', code)
-        code = re.sub(r'\b__inline__\b', 'inline', code)
-        code = re.sub(r'\b__inline\b', 'inline', code)
-        code = re.sub(r'\b__const\b', 'const', code)
-        code = re.sub(r'\b__restrict\b', 'restrict', code)
-        code = re.sub(r'\b__restrict__\b', 'restrict', code)
-        code = re.sub(r'\b__asm__\b.*?(\(.*?\))', '', code, flags=re.DOTALL)
-        code = re.sub(r'\b__int128\b', 'long long', code)
-        return code
-        
     except subprocess.CalledProcessError:
-        # GCC FAILED: Fallback to reading the raw file
+        # Fallback to reading the raw file
         with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
-            raw_code = f.read()
+            code = f.read()
             
-        # 1. Strip includes so pycparser doesn't choke on them
-        code = re.sub(r'^\s*#include\s*[<"].*?[>"]\s*$', '', raw_code, flags=re.MULTILINE)
+        # Strip includes so pycparser doesn't choke on them
+        code = re.sub(r'^\s*#include\s*[<"].*?[>"]\s*$', '', code, flags=re.MULTILINE)
         
-        # 2. Strip GNU extensions from the raw code
-        code = re.sub(r'__attribute__\s*\(\(.*?\)\)', '', code, flags=re.DOTALL)
-        code = re.sub(r'\b__extension__\b', '', code)
-        code = re.sub(r'\b__inline__\b', 'inline', code)
-        code = re.sub(r'\b__inline\b', 'inline', code)
-        code = re.sub(r'\b__const\b', 'const', code)
-        code = re.sub(r'\b__restrict\b', 'restrict', code)
-        code = re.sub(r'\b__restrict__\b', 'restrict', code)
-        code = re.sub(r'\b__asm__\b.*?(\(.*?\))', '', code, flags=re.DOTALL)
-        code = re.sub(r'\b__int128\b', 'long long', code)
-        
-        # 3. INJECT DUMMY TYPEDEFS at the very top to prevent the [pos. 7 - 8] crashes
+        # INJECT DUMMY TYPEDEFS (Removed the fatal _Bool collision)
         dummy_typedefs = """
         typedef int size_t;
         typedef int ssize_t;
@@ -288,14 +263,38 @@ def preprocess_c_code(filepath):
         typedef int uint64_t;
         typedef int int64_t;
         typedef int bool;
-        typedef int _Bool;
         typedef int pthread_t;
         typedef int pthread_mutex_t;
         typedef int pthread_cond_t;
         typedef int pthread_attr_t;
         """
-        
-        return dummy_typedefs + "\n" + code
+        code = dummy_typedefs + "\n" + code
+
+    # --- ROBUST REGEX SANITIZATION ---
+    
+    # 1. Strip attributes safely (handles up to 1 level of nested parentheses like aligned(4))
+    code = re.sub(r'__attribute__\s*\(\([^()]*(\([^()]*\)[^()]*)*\)\)', '', code)
+    
+    # 2. Fix reach_error() by matching specifically to the known SV-COMP structure end to avoid leftover braces
+    code = re.sub(
+        r'void\s+reach_error\(\)\s*\{.*?__PRETTY_FUNCTION__.*?\)\);\s*\}', 
+        'void reach_error() { abort(); }', 
+        code, 
+        flags=re.DOTALL
+    )
+    
+    # 3. Strip remaining standard GNU extensions
+    code = re.sub(r'\b__extension__\b', '', code)
+    code = re.sub(r'\b__inline__\b', 'inline', code)
+    code = re.sub(r'\b__inline\b', 'inline', code)
+    code = re.sub(r'\b__const\b', 'const', code)
+    code = re.sub(r'\b__restrict\b', 'restrict', code)
+    code = re.sub(r'\b__restrict__\b', 'restrict', code)
+    code = re.sub(r'\b__asm__\b.*?(\(.*?\))', '', code, flags=re.DOTALL)
+    code = re.sub(r'\b__int128\b', 'long long', code)
+    code = re.sub(r'\b__PRETTY_FUNCTION__\b', '""', code)
+    
+    return code
 
 def process_single_benchmark(filepath):
     base_name = os.path.basename(filepath)
